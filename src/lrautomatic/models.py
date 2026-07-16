@@ -52,6 +52,8 @@ class ImportJobRequest(BaseModel):
     recursive: bool = False
     create_collections: bool = True
     build_smart_previews: bool = False
+    develop_preset_name: str | None = None
+    develop_preset_uuid: str | None = None
     duplicate_policy: str = "skip"
 
 
@@ -67,7 +69,7 @@ class SourceProgress(BaseModel):
 
 
 class ImportJob(BaseModel):
-    schema_version: int = 1
+    schema_version: int = 2
     job_id: str = Field(default_factory=lambda: f"job_{uuid4().hex}")
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -79,8 +81,15 @@ class ImportJob(BaseModel):
     total_skipped: int = 0
     total_failed: int = 0
     current_source: str | None = None
+    active_catalog_path: str | None = None
     error: str | None = None
+    preset_status: str = "not_requested"
+    preset_name_applied: str | None = None
+    preset_applied_count: int = 0
     smart_previews_status: str = "not_requested"
+    smart_previews_created: int = 0
+    smart_previews_existed: int = 0
+    smart_previews_failed: int = 0
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc).isoformat()
