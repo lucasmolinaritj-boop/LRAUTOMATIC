@@ -152,11 +152,9 @@ local function refreshTotals(job)
     end
 end
 
-local function processSource(catalog, job, source, progress, jobPath)
+local function prepareSource(job, source, progress, jobPath)
     progress.status = 'running'
     job.current_source = source.path
-    writeJson(jobPath, job)
-
     local recursive = source.recursive
     if recursive == nil then recursive = job.request.recursive == true end
     local files = collectFiles(source.path, recursive)
@@ -164,46 +162,34 @@ local function processSource(catalog, job, source, progress, jobPath)
     refreshTotals(job)
     writeJson(jobPath, job)
     plainLog('Encontradas ' .. tostring(#files) .. ' fotos em ' .. tostring(source.path))
+    return files
+end
 
+local function importSourceInsideWrite(catalog, job, source, progress, files)
     local collectionName = source.collection
     if not collectionName or collectionName == '' then collectionName = LrPathUtils.leafName(source.path) end
 
-    local writeOk, writeErr = pcall(function()
-        catalog:withWriteAccessDo('LRAutomatic: importar pasta', function()
-            local collection = nil
-            if job.request.create_collections ~= false then
-                collection = findOrCreateCollection(catalog, collectionName, job.request.collection_set)
-            end
-
-            for _, photoPath in ipairs(files) do
-                local existing = catalog:findPhotoByPath(photoPath)
-                if existing then
-                    progress.skipped = progress.skipped + 1
-                else
-                    local importedPhoto = catalog:addPhoto(photoPath)
-                    if importedPhoto then
-                        progress.imported = progress.imported + 1
-                        if collection then collection:addPhotos({ importedPhoto }) end
-                    else
-                        progress.failed = progress.failed + 1
-                        progress.error = 'catalog:addPhoto retornou nil para ' .. tostring(photoPath)
-                    end
-                end
-            end
-        end, { timeout = 30 })
-    end)
-
-    if not writeOk then
-        progress.status = 'failed'
-        progress.error = tostring(writeErr)
-        refreshTotals(job)
-        writeJson(jobPath, job)
-        error(writeErr)
+    local collection = nil
+    if job.request.create_collections ~= false then
+        collection = findOrCreateCollection(catalog, collectionName, job.request.collection_set)
     end
 
-    refreshTotals(job)
-    progress.status = progress.failed > 0 and 'failed' or 'completed'
-    writeJson(jobPath, job)
+    for _, photoPath in ipairs(files) do
+        local existing = catalog:findPhotoByPath(photoPath)
+        if existing then
+            progress.skipped = progress.skipped + 1
+            if collection then collection:addPhotos({ existing }) end
+        else
+            local importedPhoto = catalog:addPhoto(photoPath)
+            if importedPhoto then
+                progress.imported = progress.imported + 1
+                if collection then collection:addPhotos({ importedPhoto }) end
+            else
+                progress.failed = progress.failed + 1
+                progress.error = 'catalog:addPhoto retornou nil para ' .. tostring(photoPath)
+            end
+        end
+    end
 end
 
 local function processJob(jobPath, job)
@@ -216,20 +202,28 @@ local function processJob(jobPath, job)
     writeJson(jobPath, job)
     plainLog('Iniciando job ' .. tostring(job.job_id or jobPath) .. ' no catálogo ' .. tostring(job.active_catalog_path))
 
-    local anyFailed = false
+    local prepared = {}
     for index, source in ipairs((job.request and job.request.sources) or {}) do
         local progress = job.progress and job.progress[index]
         if progress then
-            local ok, err = pcall(processSource, catalog, job, source, progress, jobPath)
-            if not ok then
-                progress.status, progress.error = 'failed', tostring(err)
-                anyFailed = true
-                plainLog('Erro na origem ' .. tostring(source.path) .. ': ' .. tostring(err))
-                writeJson(jobPath, job)
-            elseif progress.status == 'failed' then
-                anyFailed = true
+            prepared[index] = prepareSource(job, source, progress, jobPath)
+        end
+    end
+
+    -- IMPORTANT: no pcall, yield or sleep may wrap/cross this call in Lua 5.1.
+    catalog:withWriteAccessDo('LRAutomatic: importar job', function()
+        for index, source in ipairs((job.request and job.request.sources) or {}) do
+            local progress = job.progress and job.progress[index]
+            if progress then
+                importSourceInsideWrite(catalog, job, source, progress, prepared[index] or {})
             end
         end
+    end, { timeout = 30 })
+
+    local anyFailed = false
+    for _, progress in ipairs(job.progress or {}) do
+        progress.status = (progress.failed or 0) > 0 and 'failed' or 'completed'
+        if progress.status == 'failed' then anyFailed = true end
     end
 
     refreshTotals(job)
@@ -249,46 +243,34 @@ function Runner.processQueuedOnce()
     end
 
     processing = true
-    local okOuter, resultOrError = pcall(function()
-        LrFileUtils.createAllDirectories(jobsDir())
-        writeState('runner_alive.txt', timestamp() .. '\njobs=' .. jobsDir())
-        local processed, inspected = 0, 0
+    LrFileUtils.createAllDirectories(jobsDir())
+    writeState('runner_alive.txt', timestamp() .. '\njobs=' .. jobsDir())
+    local processed, inspected = 0, 0
 
-        for path in LrFileUtils.files(jobsDir()) do
-            if isJobFile(path) then
-                inspected = inspected + 1
-                local job, readError = readJson(path)
-                if not job then
-                    plainLog('JSON inválido em ' .. path .. ': ' .. tostring(readError))
-                elseif tostring(job.status) == 'queued' then
-                    local ok, result = pcall(processJob, path, job)
-                    if not ok then
-                        job.status, job.error = 'failed', tostring(result)
-                        pcall(writeJson, path, job)
-                        plainLog('Job falhou: ' .. tostring(result))
-                    elseif result then
-                        processed = processed + 1
-                    end
-                end
+    for path in LrFileUtils.files(jobsDir()) do
+        if isJobFile(path) then
+            inspected = inspected + 1
+            local job, readError = readJson(path)
+            if not job then
+                plainLog('JSON inválido em ' .. path .. ': ' .. tostring(readError))
+            elseif tostring(job.status) == 'queued' then
+                processJob(path, job)
+                processed = processed + 1
             end
         end
+    end
 
-        writeState('last_scan.txt', timestamp() .. '\ninspected=' .. tostring(inspected) .. '\nprocessed=' .. tostring(processed))
-        return processed
-    end)
+    writeState('last_scan.txt', timestamp() .. '\ninspected=' .. tostring(inspected) .. '\nprocessed=' .. tostring(processed))
     processing = false
-
-    if not okOuter then error(resultOrError) end
-    return resultOrError
+    return processed
 end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V3.0 iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V3.1 Task-Safe iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
-        local ok, err = pcall(Runner.processQueuedOnce)
-        if not ok then plainLog('Erro ao verificar fila: ' .. tostring(err)) end
+        Runner.processQueuedOnce()
         LrTasks.sleep(2)
     end
 end
