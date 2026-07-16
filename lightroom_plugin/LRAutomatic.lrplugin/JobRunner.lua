@@ -57,6 +57,10 @@ end
 local function readJson(path)
     local content = LrFileUtils.readFile(path)
     if not content then return nil, 'arquivo não pôde ser lido' end
+    -- Remove BOM UTF-8 caso algum editor tenha inserido.
+    if string.byte(content, 1) == 239 and string.byte(content, 2) == 187 and string.byte(content, 3) == 191 then
+        content = string.sub(content, 4)
+    end
     local ok, decoded = pcall(Json.decode, content)
     if not ok then return nil, tostring(decoded) end
     return decoded, nil
@@ -64,17 +68,22 @@ end
 
 local function writeJson(path, value)
     local temp = path .. '.tmp'
-    local okEncode, encoded = pcall(Json.encode, value)
-    if not okEncode then error('não foi possível serializar JSON: ' .. tostring(encoded)) end
-    local okWrite = LrFileUtils.writeFile(temp, encoded)
+    local okWrite = LrFileUtils.writeFile(temp, Json.encode(value))
     if not okWrite then error('não foi possível gravar ' .. temp) end
     if LrFileUtils.exists(path) then LrFileUtils.delete(path) end
     local moved = LrFileUtils.move(temp, path)
     if not moved then error('não foi possível substituir ' .. path) end
 end
 
-local function extension(path)
-    return string.lower(LrPathUtils.extension(path) or '')
+local function normalizedExtension(path)
+    local ext = string.lower(LrPathUtils.extension(path) or '')
+    if string.sub(ext, 1, 1) == '.' then ext = string.sub(ext, 2) end
+    return ext
+end
+
+local function isJobFile(path)
+    local name = string.lower(LrPathUtils.leafName(path) or '')
+    return string.match(name, '^job_.*%.json$') ~= nil
 end
 
 local function collectFiles(folder, recursive)
@@ -84,7 +93,7 @@ local function collectFiles(folder, recursive)
     local result = {}
     local iterator = recursive and LrFileUtils.recursiveFiles(folder) or LrFileUtils.files(folder)
     for path in iterator do
-        if SUPPORTED[extension(path)] then table.insert(result, path) end
+        if SUPPORTED[normalizedExtension(path)] then table.insert(result, path) end
     end
     table.sort(result)
     return result
@@ -221,31 +230,42 @@ function Runner.processQueuedOnce()
     LrFileUtils.createAllDirectories(jobsDir())
     writeState('runner_alive.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\njobs=' .. jobsDir())
     local processed = 0
+    local inspected = 0
     plainLog('Procurando jobs em ' .. jobsDir())
 
     for path in LrFileUtils.files(jobsDir()) do
-        if extension(path) == 'json' and string.match(LrPathUtils.leafName(path), '^job_') then
+        local leaf = LrPathUtils.leafName(path) or tostring(path)
+        plainLog('Arquivo encontrado na fila: ' .. tostring(leaf))
+        if isJobFile(path) then
+            inspected = inspected + 1
             local job, readError = readJson(path)
             if not job then
                 plainLog('JSON inválido em ' .. path .. ': ' .. tostring(readError))
-            elseif job.status == 'queued' then
-                local ok, result = pcall(processJob, path, job)
-                if not ok then
-                    job.status, job.error = 'failed', tostring(result)
-                    pcall(writeJson, path, job)
-                    plainLog('Job falhou: ' .. tostring(result))
-                elseif result then
-                    processed = processed + 1
+            else
+                plainLog('Job lido: id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status))
+                if job.status == 'queued' then
+                    local ok, result = pcall(processJob, path, job)
+                    if not ok then
+                        job.status, job.error = 'failed', tostring(result)
+                        pcall(writeJson, path, job)
+                        plainLog('Job falhou: ' .. tostring(result))
+                    elseif result then
+                        processed = processed + 1
+                    end
                 end
             end
+        else
+            plainLog('Arquivo ignorado por nome: ' .. tostring(leaf))
         end
     end
+
+    writeState('last_scan.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\ninspected=' .. tostring(inspected) .. '\nprocessed=' .. tostring(processed))
     return processed
 end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V2.6 iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V2.7 iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\nloop=running\njobs=' .. jobsDir())
         local ok, err = pcall(Runner.processQueuedOnce)
