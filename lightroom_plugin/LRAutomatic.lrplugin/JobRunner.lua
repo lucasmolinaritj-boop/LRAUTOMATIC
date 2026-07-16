@@ -35,40 +35,78 @@ local function jobsDir() return LrPathUtils.child(dataDir(), 'jobs') end
 local function logsDir() return LrPathUtils.child(dataDir(), 'logs') end
 local function stateDir() return LrPathUtils.child(dataDir(), 'plugin_state') end
 
-local function appendFile(path, text)
-    LrFileUtils.createAllDirectories(LrPathUtils.parent(path))
-    local old = LrFileUtils.readFile(path) or ''
-    LrFileUtils.writeFile(path, old .. tostring(text) .. '\n')
+local function timestamp()
+    local ok, value = pcall(os.date, '!%Y-%m-%dT%H:%M:%SZ')
+    if ok and value then return value end
+    return tostring(LrTasks.currentTime and LrTasks.currentTime() or 'time-unavailable')
+end
+
+local function hardTrace(message)
+    local text = timestamp() .. ' ' .. tostring(message) .. '\n'
+    pcall(function()
+        LrFileUtils.createAllDirectories(dataDir())
+        local path = LrPathUtils.child(dataDir(), 'runner-trace.log')
+        local old = LrFileUtils.readFile(path) or ''
+        LrFileUtils.writeFile(path, old .. text)
+    end)
 end
 
 local function plainLog(message)
-    local line = os.date('!%Y-%m-%dT%H:%M:%SZ') .. ' ' .. tostring(message)
-    pcall(appendFile, LrPathUtils.child(logsDir(), 'plugin.log'), line)
-    logger:info(tostring(message))
+    local line = timestamp() .. ' ' .. tostring(message) .. '\n'
+    hardTrace(message)
+    pcall(function()
+        LrFileUtils.createAllDirectories(logsDir())
+        local path = LrPathUtils.child(logsDir(), 'plugin.log')
+        local old = LrFileUtils.readFile(path) or ''
+        LrFileUtils.writeFile(path, old .. line)
+    end)
+    pcall(function() logger:info(tostring(message)) end)
 end
 
 local function writeState(name, text)
-    pcall(function()
+    local ok, err = pcall(function()
         LrFileUtils.createAllDirectories(stateDir())
         LrFileUtils.writeFile(LrPathUtils.child(stateDir(), name), tostring(text or ''))
     end)
+    if not ok then hardTrace('state_write_failed ' .. tostring(name) .. ': ' .. tostring(err)) end
+end
+
+local function stripBom(content)
+    if string.byte(content, 1) == 239 and string.byte(content, 2) == 187 and string.byte(content, 3) == 191 then
+        return string.sub(content, 4)
+    end
+    return content
+end
+
+local function rawStringField(content, key)
+    local pattern = '"' .. key .. '"%s*:%s*"([^"]*)"'
+    return string.match(content, pattern)
 end
 
 local function readJson(path)
     local content = LrFileUtils.readFile(path)
-    if not content then return nil, 'arquivo não pôde ser lido' end
-    -- Remove BOM UTF-8 caso algum editor tenha inserido.
-    if string.byte(content, 1) == 239 and string.byte(content, 2) == 187 and string.byte(content, 3) == 191 then
-        content = string.sub(content, 4)
-    end
+    if not content then return nil, 'arquivo não pôde ser lido', nil end
+    content = stripBom(content)
+    local rawStatus = rawStringField(content, 'status')
     local ok, decoded = pcall(Json.decode, content)
-    if not ok then return nil, tostring(decoded) end
-    return decoded, nil
+    if not ok then
+        plainLog('JSON decode falhou: ' .. tostring(decoded) .. ' rawStatus=' .. tostring(rawStatus))
+        return nil, tostring(decoded), rawStatus
+    end
+    if type(decoded) ~= 'table' then
+        return nil, 'JSON raiz não é objeto', rawStatus
+    end
+    if decoded.status == nil and rawStatus ~= nil then
+        decoded.status = rawStatus
+        plainLog('Fallback de status bruto aplicado: ' .. tostring(rawStatus))
+    end
+    return decoded, nil, rawStatus
 end
 
 local function writeJson(path, value)
     local temp = path .. '.tmp'
-    local okWrite = LrFileUtils.writeFile(temp, Json.encode(value))
+    local encoded = Json.encode(value)
+    local okWrite = LrFileUtils.writeFile(temp, encoded)
     if not okWrite then error('não foi possível gravar ' .. temp) end
     if LrFileUtils.exists(path) then LrFileUtils.delete(path) end
     local moved = LrFileUtils.move(temp, path)
@@ -82,14 +120,12 @@ local function normalizedExtension(path)
 end
 
 local function isJobFile(path)
-    local name = string.lower(LrPathUtils.leafName(path) or '')
-    return string.match(name, '^job_.*%.json$') ~= nil
+    local name = string.lower(LrPathUtils.leafName(path) or tostring(path))
+    return string.sub(name, 1, 4) == 'job_' and string.sub(name, -5) == '.json'
 end
 
 local function collectFiles(folder, recursive)
-    if not LrFileUtils.exists(folder) then
-        error('pasta de origem não existe: ' .. tostring(folder))
-    end
+    if not LrFileUtils.exists(folder) then error('pasta de origem não existe: ' .. tostring(folder)) end
     local result = {}
     local iterator = recursive and LrFileUtils.recursiveFiles(folder) or LrFileUtils.files(folder)
     for path in iterator do
@@ -198,8 +234,8 @@ local function processJob(jobPath, job)
     plainLog('Iniciando job ' .. tostring(job.job_id or jobPath) .. ' no catálogo ' .. tostring(job.active_catalog_path))
 
     local anyFailed = false
-    for index, source in ipairs(job.request.sources or {}) do
-        local progress = job.progress[index]
+    for index, source in ipairs((job.request and job.request.sources) or {}) do
+        local progress = job.progress and job.progress[index]
         if progress then
             local ok, err = pcall(processSource, catalog, job, source, progress, jobPath)
             if not ok then
@@ -228,22 +264,23 @@ end
 
 function Runner.processQueuedOnce()
     LrFileUtils.createAllDirectories(jobsDir())
-    writeState('runner_alive.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\njobs=' .. jobsDir())
-    local processed = 0
-    local inspected = 0
+    hardTrace('processQueuedOnce ENTER jobs=' .. jobsDir())
+    writeState('runner_alive.txt', timestamp() .. '\njobs=' .. jobsDir())
+
+    local processed, inspected = 0, 0
     plainLog('Procurando jobs em ' .. jobsDir())
 
     for path in LrFileUtils.files(jobsDir()) do
         local leaf = LrPathUtils.leafName(path) or tostring(path)
-        plainLog('Arquivo encontrado na fila: ' .. tostring(leaf))
+        hardTrace('ITER path=' .. tostring(path) .. ' leaf=' .. tostring(leaf))
         if isJobFile(path) then
             inspected = inspected + 1
-            local job, readError = readJson(path)
+            local job, readError, rawStatus = readJson(path)
             if not job then
-                plainLog('JSON inválido em ' .. path .. ': ' .. tostring(readError))
+                plainLog('JSON inválido em ' .. path .. ': ' .. tostring(readError) .. ' rawStatus=' .. tostring(rawStatus))
             else
-                plainLog('Job lido: id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status))
-                if job.status == 'queued' then
+                plainLog('Job lido: id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) .. ' rawStatus=' .. tostring(rawStatus))
+                if tostring(job.status) == 'queued' then
                     local ok, result = pcall(processJob, path, job)
                     if not ok then
                         job.status, job.error = 'failed', tostring(result)
@@ -259,15 +296,16 @@ function Runner.processQueuedOnce()
         end
     end
 
-    writeState('last_scan.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\ninspected=' .. tostring(inspected) .. '\nprocessed=' .. tostring(processed))
+    writeState('last_scan.txt', timestamp() .. '\ninspected=' .. tostring(inspected) .. '\nprocessed=' .. tostring(processed))
+    hardTrace('processQueuedOnce EXIT inspected=' .. tostring(inspected) .. ' processed=' .. tostring(processed))
     return processed
 end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V2.7 iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V2.8 iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
-        writeState('heartbeat.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\nloop=running\njobs=' .. jobsDir())
+        writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
         local ok, err = pcall(Runner.processQueuedOnce)
         if not ok then plainLog('Erro ao verificar fila: ' .. tostring(err)) end
         LrTasks.sleep(2)
