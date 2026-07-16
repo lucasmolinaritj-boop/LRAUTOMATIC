@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lrautomatic"
-version = "0.2.0"
-description = "CLI, desktop app, local API and Lightroom Classic plugin bridge"
+version = "0.4.0"
+description = "CLI, desktop app, local API and Lightroom Classic automation pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
