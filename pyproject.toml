@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lrautomatic"
-version = "0.4.0"
-description = "CLI, desktop app, local API and Lightroom Classic automation pipeline"
+version = "0.5.0"
+description = "Home Picz control center, Lightroom Classic automation, API and Windows service"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,12 +13,16 @@ dependencies = [
   "uvicorn[standard]>=0.30,<1",
   "pydantic>=2.8,<3",
   "typer>=0.12,<1",
-  "httpx>=0.27,<1"
+  "httpx>=0.27,<1",
+  "pywin32>=306; platform_system == 'Windows'",
+  "psutil>=6,<8"
 ]
 
 [project.scripts]
 lrautomatic = "lrautomatic.cli:app"
 lrautomatic-desktop = "lrautomatic.desktop:main"
+lrautomatic-session-agent = "lrautomatic.session_agent:main"
+lrautomatic-service = "lrautomatic.windows_service:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
