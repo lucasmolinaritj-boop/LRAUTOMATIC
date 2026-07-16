@@ -15,8 +15,14 @@ local function dataDir()
     local base = os.getenv('LOCALAPPDATA') or LrPathUtils.getStandardFilePath('appData')
     return LrPathUtils.child(base, 'LRAutomatic')
 end
-
 local function jobsDir() return LrPathUtils.child(dataDir(), 'jobs') end
+local function logsDir() return LrPathUtils.child(dataDir(), 'logs') end
+local function log(message)
+    LrFileUtils.createAllDirectories(logsDir())
+    local path = LrPathUtils.child(logsDir(), 'plugin.log')
+    local old = LrFileUtils.readFile(path) or ''
+    LrFileUtils.writeFile(path, old .. os.date('!%Y-%m-%dT%H:%M:%SZ') .. ' ' .. tostring(message) .. '\n')
+end
 
 local function readJson(path)
     local content = LrFileUtils.readFile(path)
@@ -32,16 +38,11 @@ local function writeJson(path, value)
     LrFileUtils.move(temp, path)
 end
 
-local function extension(path)
-    return string.lower(LrPathUtils.extension(path) or '')
-end
-
+local function extension(path) return string.lower(LrPathUtils.extension(path) or '') end
 local function collectFiles(folder, recursive)
     local result = {}
     local iterator = recursive and LrFileUtils.recursiveFiles(folder) or LrFileUtils.files(folder)
-    for path in iterator do
-        if SUPPORTED[extension(path)] then table.insert(result, path) end
-    end
+    for path in iterator do if SUPPORTED[extension(path)] then table.insert(result, path) end end
     table.sort(result)
     return result
 end
@@ -56,9 +57,7 @@ local function findOrCreateCollection(catalog, name, setName)
         if not parent then parent = catalog:createCollectionSet(setName, nil, true) end
     end
     local collections = parent and parent:getChildCollections() or catalog:getChildCollections()
-    for _, collection in ipairs(collections) do
-        if collection:getName() == name then return collection end
-    end
+    for _, collection in ipairs(collections) do if collection:getName() == name then return collection end end
     return catalog:createCollection(name, parent, true)
 end
 
@@ -77,6 +76,36 @@ local function externallyCancelled(jobPath)
     return latest and latest.status == 'cancelled'
 end
 
+local function quoteWindows(value)
+    return '"' .. string.gsub(value, '"', '\\"') .. '"'
+end
+
+local function requestSmartPreviews(catalog, photos, progress)
+    if not photos or #photos == 0 then return true end
+    local selectedOk, selectedErr = pcall(function()
+        catalog:setSelectedPhotos(photos[1], photos)
+    end)
+    if not selectedOk then
+        progress.smart_previews_status = 'selection_failed'
+        progress.smart_previews_error = tostring(selectedErr)
+        log('Falha ao selecionar fotos para Smart Preview: ' .. tostring(selectedErr))
+        return false
+    end
+
+    local script = LrPathUtils.child(_PLUGIN.path, 'BuildSmartPreviews.ps1')
+    local command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' .. quoteWindows(script)
+    log('Executando Smart Preview: ' .. command)
+    local exitCode = LrTasks.execute(command)
+    progress.smart_previews_exit_code = exitCode
+    if exitCode == 0 then
+        progress.smart_previews_status = 'requested'
+        return true
+    end
+    progress.smart_previews_status = 'failed'
+    progress.smart_previews_error = 'PowerShell retornou código ' .. tostring(exitCode)
+    return false
+end
+
 local function processSource(catalog, job, source, progress, jobPath)
     progress.status = 'running'
     job.current_source = source.path
@@ -91,7 +120,6 @@ local function processSource(catalog, job, source, progress, jobPath)
 
     local collectionName = source.collection
     if not collectionName or collectionName == '' then collectionName = LrPathUtils.leafName(source.path) end
-
     local collection = nil
     if job.request.create_collections ~= false then
         catalog:withWriteAccessDo('LRAutomatic: preparar coleção', function()
@@ -99,10 +127,10 @@ local function processSource(catalog, job, source, progress, jobPath)
         end)
     end
 
+    local importedPhotos = {}
     for _, photoPath in ipairs(files) do
         if externallyCancelled(jobPath) then
-            job.status = 'cancelled'
-            progress.status = 'cancelled'
+            job.status, progress.status = 'cancelled', 'cancelled'
             writeJson(jobPath, job)
             return
         end
@@ -126,14 +154,21 @@ local function processSource(catalog, job, source, progress, jobPath)
             end)
             if ok and importedPhoto then
                 progress.imported = progress.imported + 1
+                table.insert(importedPhotos, importedPhoto)
             else
                 progress.failed = progress.failed + 1
                 progress.error = tostring(err or 'Falha desconhecida ao importar')
+                log('Falha ao importar ' .. photoPath .. ': ' .. progress.error)
             end
         end
         refreshTotals(job)
         writeJson(jobPath, job)
         LrTasks.yield()
+    end
+
+    if job.request.build_smart_previews == true and #importedPhotos > 0 then
+        requestSmartPreviews(catalog, importedPhotos, progress)
+        writeJson(jobPath, job)
     end
     progress.status = progress.failed > 0 and 'failed' or 'completed'
 end
@@ -143,6 +178,7 @@ local function processJob(jobPath, job)
     local catalog = LrApplication.activeCatalog()
     job.status, job.error = 'running', nil
     writeJson(jobPath, job)
+    log('Iniciando job ' .. tostring(job.id or jobPath))
     local anyFailed = false
 
     for index, source in ipairs(job.request.sources or {}) do
@@ -152,10 +188,9 @@ local function processJob(jobPath, job)
             if not ok then
                 progress.status, progress.error = 'failed', tostring(err)
                 anyFailed = true
+                log('Erro no source ' .. tostring(source.path) .. ': ' .. tostring(err))
                 writeJson(jobPath, job)
-            elseif progress.status == 'failed' then
-                anyFailed = true
-            end
+            elseif progress.status == 'failed' then anyFailed = true end
         end
         if job.status == 'cancelled' then break end
     end
@@ -168,10 +203,13 @@ local function processJob(jobPath, job)
         else job.status = 'completed' end
     end
     writeJson(jobPath, job)
+    log('Finalizando job com status ' .. tostring(job.status))
 end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
+    LrFileUtils.createAllDirectories(logsDir())
+    log('Plugin iniciado')
     while not shouldStop() do
         for path in LrFileUtils.files(jobsDir()) do
             if extension(path) == 'json' and string.match(LrPathUtils.leafName(path), '^job_') then
@@ -181,12 +219,14 @@ function Runner.runLoop(shouldStop)
                     if not ok then
                         job.status, job.error = 'failed', tostring(err)
                         writeJson(path, job)
+                        log('Erro fatal no job: ' .. tostring(err))
                     end
                 end
             end
         end
         LrTasks.sleep(2)
     end
+    log('Plugin encerrado')
 end
 
 return Runner
