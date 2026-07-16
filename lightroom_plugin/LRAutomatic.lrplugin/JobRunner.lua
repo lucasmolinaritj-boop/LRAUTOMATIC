@@ -22,13 +22,7 @@ local function homePath()
 end
 
 local function dataDir()
-    return LrPathUtils.child(
-        LrPathUtils.child(
-            LrPathUtils.child(homePath(), 'AppData'),
-            'Local'
-        ),
-        'LRAutomatic'
-    )
+    return LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(homePath(), 'AppData'), 'Local'), 'LRAutomatic')
 end
 
 local function jobsDir() return LrPathUtils.child(dataDir(), 'jobs') end
@@ -38,36 +32,51 @@ local function stateDir() return LrPathUtils.child(dataDir(), 'plugin_state') en
 local function timestamp()
     local ok, value = pcall(os.date, '!%Y-%m-%dT%H:%M:%SZ')
     if ok and value then return value end
-    return tostring(LrTasks.currentTime and LrTasks.currentTime() or 'time-unavailable')
+    return 'time-unavailable'
+end
+
+local function readText(path)
+    local file, err = io.open(path, 'rb')
+    if not file then return nil, err end
+    local content = file:read('*a')
+    file:close()
+    return content, nil
+end
+
+local function writeText(path, content)
+    local file, err = io.open(path, 'wb')
+    if not file then return false, err end
+    local ok, writeErr = file:write(content or '')
+    file:close()
+    if not ok then return false, writeErr end
+    return true, nil
+end
+
+local function appendText(path, content)
+    local file, err = io.open(path, 'ab')
+    if not file then return false, err end
+    local ok, writeErr = file:write(content or '')
+    file:close()
+    if not ok then return false, writeErr end
+    return true, nil
 end
 
 local function hardTrace(message)
-    local text = timestamp() .. ' ' .. tostring(message) .. '\n'
-    pcall(function()
-        LrFileUtils.createAllDirectories(dataDir())
-        local path = LrPathUtils.child(dataDir(), 'runner-trace.log')
-        local old = LrFileUtils.readFile(path) or ''
-        LrFileUtils.writeFile(path, old .. text)
-    end)
+    LrFileUtils.createAllDirectories(dataDir())
+    local path = LrPathUtils.child(dataDir(), 'runner-trace.log')
+    appendText(path, timestamp() .. ' ' .. tostring(message) .. '\n')
 end
 
 local function plainLog(message)
-    local line = timestamp() .. ' ' .. tostring(message) .. '\n'
     hardTrace(message)
-    pcall(function()
-        LrFileUtils.createAllDirectories(logsDir())
-        local path = LrPathUtils.child(logsDir(), 'plugin.log')
-        local old = LrFileUtils.readFile(path) or ''
-        LrFileUtils.writeFile(path, old .. line)
-    end)
+    LrFileUtils.createAllDirectories(logsDir())
+    appendText(LrPathUtils.child(logsDir(), 'plugin.log'), timestamp() .. ' ' .. tostring(message) .. '\n')
     pcall(function() logger:info(tostring(message)) end)
 end
 
 local function writeState(name, text)
-    local ok, err = pcall(function()
-        LrFileUtils.createAllDirectories(stateDir())
-        LrFileUtils.writeFile(LrPathUtils.child(stateDir(), name), tostring(text or ''))
-    end)
+    LrFileUtils.createAllDirectories(stateDir())
+    local ok, err = writeText(LrPathUtils.child(stateDir(), name), tostring(text or ''))
     if not ok then hardTrace('state_write_failed ' .. tostring(name) .. ': ' .. tostring(err)) end
 end
 
@@ -79,13 +88,12 @@ local function stripBom(content)
 end
 
 local function rawStringField(content, key)
-    local pattern = '"' .. key .. '"%s*:%s*"([^"]*)"'
-    return string.match(content, pattern)
+    return string.match(content, '"' .. key .. '"%s*:%s*"([^"]*)"')
 end
 
 local function readJson(path)
-    local content = LrFileUtils.readFile(path)
-    if not content then return nil, 'arquivo não pôde ser lido', nil end
+    local content, readErr = readText(path)
+    if not content then return nil, 'arquivo não pôde ser lido: ' .. tostring(readErr), nil end
     content = stripBom(content)
     local rawStatus = rawStringField(content, 'status')
     local ok, decoded = pcall(Json.decode, content)
@@ -93,21 +101,16 @@ local function readJson(path)
         plainLog('JSON decode falhou: ' .. tostring(decoded) .. ' rawStatus=' .. tostring(rawStatus))
         return nil, tostring(decoded), rawStatus
     end
-    if type(decoded) ~= 'table' then
-        return nil, 'JSON raiz não é objeto', rawStatus
-    end
-    if decoded.status == nil and rawStatus ~= nil then
-        decoded.status = rawStatus
-        plainLog('Fallback de status bruto aplicado: ' .. tostring(rawStatus))
-    end
+    if type(decoded) ~= 'table' then return nil, 'JSON raiz não é objeto', rawStatus end
+    if decoded.status == nil and rawStatus ~= nil then decoded.status = rawStatus end
     return decoded, nil, rawStatus
 end
 
 local function writeJson(path, value)
     local temp = path .. '.tmp'
     local encoded = Json.encode(value)
-    local okWrite = LrFileUtils.writeFile(temp, encoded)
-    if not okWrite then error('não foi possível gravar ' .. temp) end
+    local okWrite, writeErr = writeText(temp, encoded)
+    if not okWrite then error('não foi possível gravar ' .. temp .. ': ' .. tostring(writeErr)) end
     if LrFileUtils.exists(path) then LrFileUtils.delete(path) end
     local moved = LrFileUtils.move(temp, path)
     if not moved then error('não foi possível substituir ' .. path) end
@@ -214,7 +217,6 @@ local function processSource(catalog, job, source, progress, jobPath)
                 plainLog('Falha ao importar ' .. photoPath .. ': ' .. progress.error)
             end
         end
-
         refreshTotals(job)
         writeJson(jobPath, job)
         LrTasks.yield()
@@ -224,7 +226,7 @@ local function processSource(catalog, job, source, progress, jobPath)
 end
 
 local function processJob(jobPath, job)
-    if job.status ~= 'queued' then return false end
+    if tostring(job.status) ~= 'queued' then return false end
     local catalog = LrApplication.activeCatalog()
     if not catalog then error('nenhum catálogo ativo no Lightroom') end
 
@@ -266,9 +268,7 @@ function Runner.processQueuedOnce()
     LrFileUtils.createAllDirectories(jobsDir())
     hardTrace('processQueuedOnce ENTER jobs=' .. jobsDir())
     writeState('runner_alive.txt', timestamp() .. '\njobs=' .. jobsDir())
-
     local processed, inspected = 0, 0
-    plainLog('Procurando jobs em ' .. jobsDir())
 
     for path in LrFileUtils.files(jobsDir()) do
         local leaf = LrPathUtils.leafName(path) or tostring(path)
@@ -291,8 +291,6 @@ function Runner.processQueuedOnce()
                     end
                 end
             end
-        else
-            plainLog('Arquivo ignorado por nome: ' .. tostring(leaf))
         end
     end
 
@@ -303,7 +301,7 @@ end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V2.8 iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V2.9 iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
         local ok, err = pcall(Runner.processQueuedOnce)
