@@ -1,25 +1,33 @@
 local LrTasks = import 'LrTasks'
 
-_G.LRAutomaticShutdown = false
+-- Kill every loop left alive by a previous plug-in reload before starting a new one.
+_G.LRAutomaticShutdown = true
+_G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
+local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '3.1-task-safe-lr104'
+_G.LRAutomaticVersion = '3.4-single-loop-lr104'
 _G.LRAutomaticLastError = nil
 
--- The Lightroom Lua 5.1 runtime cannot yield across pcall/C boundaries.
--- Keep the long-running loop directly inside the asynchronous task.
 LrTasks.startAsyncTask(function()
+    -- Give older loops enough time to observe Shutdown=true and exit.
+    LrTasks.sleep(3)
+    if myGeneration ~= _G.LRAutomaticGeneration then return end
+
     local okRequire, Runner = pcall(require, 'JobRunner')
     if not okRequire then
         _G.LRAutomaticLastError = tostring(Runner)
         return
     end
 
+    _G.LRAutomaticShutdown = false
     _G.LRAutomaticLoopRunning = true
     _G.LRAutomaticLastError = nil
 
     Runner.runLoop(function()
-        return _G.LRAutomaticShutdown == true
+        return _G.LRAutomaticShutdown == true or myGeneration ~= _G.LRAutomaticGeneration
     end)
 
-    _G.LRAutomaticLoopRunning = false
+    if myGeneration == _G.LRAutomaticGeneration then
+        _G.LRAutomaticLoopRunning = false
+    end
 end)
