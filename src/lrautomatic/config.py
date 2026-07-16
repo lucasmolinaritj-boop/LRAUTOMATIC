@@ -15,6 +15,9 @@ class Settings:
     catalog_template: Path | None = None
     catalog_output_root: Path | None = None
     lightroom_executable: Path | None = None
+    catalog_naming_template: str = "{date} scout"
+    catalog_date_format: str = "%d%m%Y"
+    catalog_date_source: str = "earliest_file"
     homepicz_appscript_url: str | None = None
     homepicz_photos_root: Path = Path(r"M:\Meu Drive\Homepicz\Fotos do dia")
     homepicz_interval_minutes: int = 30
@@ -63,6 +66,10 @@ def load_settings(path: str | Path = "config.json") -> Settings:
     if config_path.exists():
         raw = json.loads(config_path.read_text(encoding="utf-8"))
 
+    date_source = str(raw.get("catalog_date_source", "earliest_file")).strip().lower()
+    if date_source not in {"earliest_file", "today"}:
+        raise ValueError("catalog_date_source deve ser 'earliest_file' ou 'today'")
+
     settings = Settings(
         host=str(raw.get("host", "127.0.0.1")),
         port=int(raw.get("port", 45821)),
@@ -71,6 +78,9 @@ def load_settings(path: str | Path = "config.json") -> Settings:
         catalog_template=_optional_path(raw.get("catalog_template")),
         catalog_output_root=_optional_path(raw.get("catalog_output_root")),
         lightroom_executable=_optional_path(raw.get("lightroom_executable")),
+        catalog_naming_template=str(raw.get("catalog_naming_template", "{date} scout")),
+        catalog_date_format=str(raw.get("catalog_date_format", "%d%m%Y")),
+        catalog_date_source=date_source,
         homepicz_appscript_url=raw.get("homepicz_appscript_url"),
         homepicz_photos_root=Path(os.path.expandvars(raw.get("homepicz_photos_root", r"M:\Meu Drive\Homepicz\Fotos do dia"))).expanduser().resolve(),
         homepicz_interval_minutes=max(1, int(raw.get("homepicz_interval_minutes", 30))),
