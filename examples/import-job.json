@@ -1,0 +1,19 @@
+{
+  "collection_set": "Trabalhos 16-07-2026",
+  "recursive": true,
+  "create_collections": true,
+  "build_smart_previews": false,
+  "duplicate_policy": "skip",
+  "sources": [
+    {
+      "path": "E:\\Imovel_101",
+      "collection": "Casa 101",
+      "keywords": ["imovel", "casa-101"]
+    },
+    {
+      "path": "E:\\Imovel_102",
+      "collection": "Casa 102",
+      "keywords": ["imovel", "casa-102"]
+    }
+  ]
+}
