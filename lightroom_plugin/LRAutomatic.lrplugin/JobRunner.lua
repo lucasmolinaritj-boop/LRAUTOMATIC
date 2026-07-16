@@ -61,22 +61,18 @@ local function appendText(path, content)
     return true, nil
 end
 
-local function hardTrace(message)
-    LrFileUtils.createAllDirectories(dataDir())
-    appendText(LrPathUtils.child(dataDir(), 'runner-trace.log'), timestamp() .. ' ' .. tostring(message) .. '\n')
-end
-
 local function plainLog(message)
-    hardTrace(message)
+    LrFileUtils.createAllDirectories(dataDir())
     LrFileUtils.createAllDirectories(logsDir())
-    appendText(LrPathUtils.child(logsDir(), 'plugin.log'), timestamp() .. ' ' .. tostring(message) .. '\n')
+    local line = timestamp() .. ' ' .. tostring(message) .. '\n'
+    appendText(LrPathUtils.child(dataDir(), 'runner-trace.log'), line)
+    appendText(LrPathUtils.child(logsDir(), 'plugin.log'), line)
     pcall(function() logger:info(tostring(message)) end)
 end
 
 local function writeState(name, text)
     LrFileUtils.createAllDirectories(stateDir())
-    local ok, err = writeText(LrPathUtils.child(stateDir(), name), tostring(text or ''))
-    if not ok then hardTrace('state_write_failed ' .. tostring(name) .. ': ' .. tostring(err)) end
+    writeText(LrPathUtils.child(stateDir(), name), tostring(text or ''))
 end
 
 local function stripBom(content)
@@ -89,8 +85,7 @@ end
 local function readJson(path)
     local content, err = readText(path)
     if not content then return nil, 'arquivo não pôde ser lido: ' .. tostring(err) end
-    content = stripBom(content)
-    local ok, decoded = pcall(Json.decode, content)
+    local ok, decoded = pcall(Json.decode, stripBom(content))
     if not ok then return nil, tostring(decoded) end
     if type(decoded) ~= 'table' then return nil, 'JSON raiz não é objeto' end
     return decoded, nil
@@ -136,6 +131,32 @@ local function refreshTotals(job)
     end
 end
 
+local function withWriteRetry(catalog, actionName, fn, detail)
+    for attempt = 1, 3 do
+        local ran = false
+        local timedOut = false
+        plainLog('WRITE_BEGIN action=' .. actionName .. ' attempt=' .. attempt .. ' detail=' .. tostring(detail))
+        local status = catalog:withWriteAccessDo(actionName, function(context)
+            ran = true
+            fn(context)
+        end, {
+            timeout = 10,
+            callback = function()
+                timedOut = true
+            end,
+        })
+        plainLog('WRITE_END action=' .. actionName .. ' attempt=' .. attempt ..
+            ' status=' .. tostring(status) .. ' ran=' .. tostring(ran) ..
+            ' timeout=' .. tostring(timedOut))
+
+        if ran and (status == nil or status == 'executed') then
+            return true, 'executed'
+        end
+        if attempt < 3 then LrTasks.sleep(attempt) end
+    end
+    return false, 'write_access_aborted'
+end
+
 local function findCollection(catalog, name)
     for _, collection in ipairs(catalog:getChildCollections()) do
         if collection:getName() == name then return collection end
@@ -144,61 +165,65 @@ local function findCollection(catalog, name)
 end
 
 local function ensureCollection(catalog, name)
-    if not name or name == '' then return nil end
+    if not name or name == '' then return nil, nil end
     local existing = findCollection(catalog, name)
-    if existing then return existing end
-    plainLog('WRITE_WAIT_BEGIN action=create_collection name=' .. tostring(name))
-    catalog:withWriteAccessDo('LRAutomatic: criar coleção', function()
+    if existing then return existing, nil end
+
+    local ok, reason = withWriteRetry(catalog, 'LRAutomatic: criar coleção', function()
         catalog:createCollection(name, nil, true)
-    end, { timeout = 30 })
-    plainLog('WRITE_WAIT_END action=create_collection name=' .. tostring(name))
-    return findCollection(catalog, name)
+    end, name)
+    if not ok then return nil, reason end
+    return findCollection(catalog, name), nil
 end
 
 local function importOne(catalog, photoPath)
-    plainLog('ADD_PHOTO_BEGIN path=' .. tostring(photoPath))
     local before = catalog:findPhotoByPath(photoPath)
     if before then
-        plainLog('ADD_PHOTO_SKIP_ALREADY_EXISTS path=' .. tostring(photoPath) .. ' photo=' .. tostring(before))
-        return before, 'skipped'
+        plainLog('ADD_PHOTO_SKIPPED path=' .. tostring(photoPath))
+        return before, 'skipped', nil
     end
 
     local importedPhoto = nil
-    plainLog('WRITE_WAIT_BEGIN action=import_photo path=' .. tostring(photoPath))
-    catalog:withWriteAccessDo('LRAutomatic: importar foto', function()
+    local ok, reason = withWriteRetry(catalog, 'LRAutomatic: importar foto', function()
         importedPhoto = catalog:addPhoto(photoPath)
-    end, { timeout = 30 })
-    plainLog('WRITE_WAIT_END action=import_photo path=' .. tostring(photoPath))
+    end, photoPath)
+
+    if not ok then
+        plainLog('ADD_PHOTO_WRITE_ABORTED path=' .. tostring(photoPath))
+        return nil, 'failed', reason
+    end
 
     local after = importedPhoto or catalog:findPhotoByPath(photoPath)
-    plainLog('ADD_PHOTO_END path=' .. tostring(photoPath) .. ' returned=' .. tostring(importedPhoto) .. ' found_after=' .. tostring(after))
-    if after then return after, 'imported' end
-    return nil, 'failed'
+    plainLog('ADD_PHOTO_RESULT path=' .. tostring(photoPath) ..
+        ' returned=' .. tostring(importedPhoto) .. ' found=' .. tostring(after))
+    if after then return after, 'imported', nil end
+    return nil, 'failed', 'addPhoto executou, mas a foto não apareceu no catálogo'
 end
 
 local function processSource(catalog, job, source, progress, jobPath)
     progress.status = 'running'
     job.current_source = source.path
+
     local recursive = source.recursive
     if recursive == nil then recursive = job.request.recursive == true end
     local files = collectFiles(source.path, recursive)
     progress.discovered = #files
     refreshTotals(job)
     writeJson(jobPath, job)
-    plainLog('Encontradas ' .. tostring(#files) .. ' fotos em ' .. tostring(source.path))
+    plainLog('SOURCE_DISCOVERED path=' .. tostring(source.path) .. ' count=' .. tostring(#files))
 
-    local addedPhotos = {}
+    local photosForCollection = {}
     for _, photoPath in ipairs(files) do
-        local photo, result = importOne(catalog, photoPath)
+        local photo, result, err = importOne(catalog, photoPath)
         if result == 'imported' then
             progress.imported = progress.imported + 1
-            table.insert(addedPhotos, photo)
+            table.insert(photosForCollection, photo)
         elseif result == 'skipped' then
             progress.skipped = progress.skipped + 1
-            table.insert(addedPhotos, photo)
+            table.insert(photosForCollection, photo)
         else
             progress.failed = progress.failed + 1
-            progress.error = 'A foto não apareceu no catálogo após addPhoto: ' .. tostring(photoPath)
+            progress.error = tostring(err) .. ': ' .. tostring(photoPath)
         end
         refreshTotals(job)
         writeJson(jobPath, job)
@@ -206,27 +231,27 @@ local function processSource(catalog, job, source, progress, jobPath)
 
     local collectionName = source.collection
     if not collectionName or collectionName == '' then collectionName = LrPathUtils.leafName(source.path) end
-    if job.request.create_collections ~= false and #addedPhotos > 0 then
-        local collection = ensureCollection(catalog, collectionName)
+    if job.request.create_collections ~= false and #photosForCollection > 0 then
+        local collection, collectionErr = ensureCollection(catalog, collectionName)
         if collection then
-            plainLog('WRITE_WAIT_BEGIN action=collection_add name=' .. tostring(collectionName))
-            catalog:withWriteAccessDo('LRAutomatic: adicionar à coleção', function()
-                collection:addPhotos(addedPhotos)
-            end, { timeout = 30 })
-            plainLog('WRITE_WAIT_END action=collection_add name=' .. tostring(collectionName))
-            plainLog('COLLECTION_ADD name=' .. tostring(collectionName) .. ' count=' .. tostring(#addedPhotos))
+            local ok, reason = withWriteRetry(catalog, 'LRAutomatic: adicionar à coleção', function()
+                collection:addPhotos(photosForCollection)
+            end, collectionName)
+            if not ok then
+                progress.error = 'Fotos importadas, mas coleção falhou: ' .. tostring(reason)
+                plainLog(progress.error)
+            end
         else
-            progress.failed = progress.failed + #addedPhotos
-            progress.error = 'Não foi possível criar ou localizar a coleção ' .. tostring(collectionName)
+            progress.error = 'Fotos importadas, mas coleção não foi criada: ' .. tostring(collectionErr)
+            plainLog(progress.error)
         end
     end
 
     local accounted = (progress.imported or 0) + (progress.skipped or 0) + (progress.failed or 0)
     if accounted ~= (progress.discovered or 0) then
         progress.failed = (progress.failed or 0) + math.abs((progress.discovered or 0) - accounted)
-        progress.error = 'Totais inconsistentes: discovered=' .. tostring(progress.discovered) .. ' accounted=' .. tostring(accounted)
+        progress.error = 'Totais inconsistentes'
     end
-
     progress.status = (progress.failed or 0) > 0 and 'failed' or 'completed'
     refreshTotals(job)
     writeJson(jobPath, job)
@@ -240,7 +265,7 @@ local function processJob(jobPath, job)
     job.active_catalog_path = catalog:getPath()
     job.status, job.error = 'running', nil
     writeJson(jobPath, job)
-    plainLog('Iniciando job ' .. tostring(job.job_id or jobPath) .. ' no catálogo ' .. tostring(job.active_catalog_path))
+    plainLog('JOB_BEGIN id=' .. tostring(job.job_id) .. ' catalog=' .. tostring(job.active_catalog_path))
 
     local anyFailed = false
     for index, source in ipairs((job.request and job.request.sources) or {}) do
@@ -255,22 +280,18 @@ local function processJob(jobPath, job)
     job.current_source = nil
     if anyFailed and job.total_imported > 0 then job.status = 'partial'
     elseif anyFailed then job.status = 'failed'
-    elseif job.total_discovered ~= (job.total_imported + job.total_skipped + job.total_failed) then
-        job.status = 'failed'
-        job.error = 'Totais finais inconsistentes'
     else job.status = 'completed' end
     writeJson(jobPath, job)
-    plainLog('Job finalizado: ' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) .. ' discovered=' .. tostring(job.total_discovered) .. ' imported=' .. tostring(job.total_imported) .. ' skipped=' .. tostring(job.total_skipped) .. ' failed=' .. tostring(job.total_failed))
+    plainLog('JOB_END id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) ..
+        ' imported=' .. tostring(job.total_imported) .. ' skipped=' .. tostring(job.total_skipped) ..
+        ' failed=' .. tostring(job.total_failed))
     return true
 end
 
 function Runner.processQueuedOnce()
-    if processing then
-        plainLog('Fila já está sendo processada; chamada concorrente ignorada')
-        return 0
-    end
-
+    if processing then return 0 end
     processing = true
+
     LrFileUtils.createAllDirectories(jobsDir())
     writeState('runner_alive.txt', timestamp() .. '\njobs=' .. jobsDir())
     local processed, inspected = 0, 0
@@ -280,7 +301,7 @@ function Runner.processQueuedOnce()
             inspected = inspected + 1
             local job, readError = readJson(path)
             if not job then
-                plainLog('JSON inválido em ' .. path .. ': ' .. tostring(readError))
+                plainLog('JSON_INVALID path=' .. path .. ' error=' .. tostring(readError))
             elseif tostring(job.status) == 'queued' then
                 processJob(path, job)
                 processed = processed + 1
@@ -288,19 +309,20 @@ function Runner.processQueuedOnce()
         end
     end
 
-    writeState('last_scan.txt', timestamp() .. '\ninspected=' .. tostring(inspected) .. '\nprocessed=' .. tostring(processed))
+    writeState('last_scan.txt', timestamp() .. '\ninspected=' .. inspected .. '\nprocessed=' .. processed)
     processing = false
     return processed
 end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V3.3 Write Wait iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V3.4 Single Loop iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
         Runner.processQueuedOnce()
         LrTasks.sleep(2)
     end
+    plainLog('Plugin V3.4 loop encerrado')
 end
 
 function Runner.getJobsDir() return jobsDir() end
