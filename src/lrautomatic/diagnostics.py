@@ -28,7 +28,7 @@ def _command_output(command: list[str]) -> str:
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=12, check=False)
         return (completed.stdout + '\n' + completed.stderr).strip()
-    except Exception as exc:  # diagnostics must never crash the app
+    except Exception as exc:
         return f'ERROR: {type(exc).__name__}: {exc}'
 
 
@@ -58,6 +58,7 @@ def create_diagnostic_zip(settings: Settings, config_path: str | Path = 'config.
         (root / 'system.json').write_text(json.dumps(system_info, ensure_ascii=False, indent=2), encoding='utf-8')
         (root / 'pip_freeze.txt').write_text(_command_output([sys.executable, '-m', 'pip', 'freeze']), encoding='utf-8')
         (root / 'processes.txt').write_text(_command_output(['tasklist']), encoding='utf-8')
+        (root / 'ports.txt').write_text(_command_output(['netstat', '-ano']), encoding='utf-8')
 
         config_file = Path(config_path)
         if config_file.exists():
@@ -67,12 +68,12 @@ def create_diagnostic_zip(settings: Settings, config_path: str | Path = 'config.
             except Exception as exc:
                 (root / 'config_error.txt').write_text(str(exc), encoding='utf-8')
 
-        for folder_name in ('jobs', 'responses', 'control', 'logs'):
+        for folder_name in ('jobs', 'responses', 'control', 'logs', 'plugin_state'):
             source = settings.data_dir / folder_name
             if source.exists():
                 target = root / folder_name
                 target.mkdir(parents=True, exist_ok=True)
-                files = sorted((p for p in source.rglob('*') if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)[:100]
+                files = sorted((p for p in source.rglob('*') if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)[:200]
                 for file in files:
                     rel = file.relative_to(source)
                     dest = target / rel
