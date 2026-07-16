@@ -40,7 +40,9 @@ def import_photos(
     job: Path | None = typer.Option(None, "--job", exists=True, dir_okay=False),
     collection_set: str | None = typer.Option(None),
     recursive: bool = typer.Option(False),
-    smart_previews: bool = typer.Option(False, help="Seleciona as importadas e pede ao próprio Lightroom para criar Smart Previews"),
+    smart_previews: bool = typer.Option(False, "--smart-previews", help="Gera Smart Previews oficiais pelo SDK do Lightroom"),
+    preset: str | None = typer.Option(None, "--preset", help="Nome exato do preset de Revelação já instalado no Lightroom"),
+    preset_uuid: str | None = typer.Option(None, "--preset-uuid", help="UUID do preset de Revelação"),
     config: str = typer.Option("config.json"),
 ) -> None:
     if job:
@@ -57,6 +59,8 @@ def import_photos(
             collection_set=collection_set,
             recursive=recursive,
             build_smart_previews=smart_previews,
+            develop_preset_name=preset,
+            develop_preset_uuid=preset_uuid,
         )
 
     client, headers = _client(config)
@@ -101,7 +105,12 @@ def catalog_create(
     config: str = typer.Option("config.json"),
 ) -> None:
     result = create_catalog(load_settings(config), name, open_lightroom=open_lightroom)
-    typer.echo(json.dumps({"catalog_path": str(result.catalog_path), "launched": result.launched}, ensure_ascii=False, indent=2))
+    typer.echo(json.dumps({
+        "catalog_path": str(result.catalog_path),
+        "catalog_dir": str(result.catalog_dir),
+        "launched": result.launched,
+        "manifest_path": str(result.manifest_path),
+    }, ensure_ascii=False, indent=2))
 
 
 @app.command("diagnostic-zip")
