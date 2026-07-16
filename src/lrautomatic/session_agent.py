@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import logging
 import subprocess
 import sys
@@ -13,6 +12,8 @@ import win32gui
 import win32process
 
 from .config import load_settings
+from .homepicz_scheduler import HomePiczScheduler
+from .store import JobStore
 
 log = logging.getLogger("lrautomatic.session_agent")
 
@@ -64,13 +65,13 @@ def close_lightroom(timeout_seconds: int = 90, force_timeout_seconds: int = 15) 
             return True
         time.sleep(1)
 
-    log.warning("Lightroom não encerrou em %ss; iniciando encerramento forçado", timeout_seconds)
+    log.warning("Lightroom não encerrou em %ss; encerramento forçado será usado", timeout_seconds)
     for process in processes:
         try:
             process.terminate()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    gone, alive = psutil.wait_procs(processes, timeout=force_timeout_seconds)
+    _, alive = psutil.wait_procs(processes, timeout=force_timeout_seconds)
     for process in alive:
         try:
             process.kill()
@@ -95,9 +96,7 @@ def _active_catalog_hint(settings) -> Path | None:
         raw = (settings.control_dir / "agent_open_catalog.txt").read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return None
-    if not raw:
-        return None
-    return Path(raw)
+    return Path(raw) if raw else None
 
 
 def open_catalog(settings, catalog_path: Path) -> None:
@@ -105,11 +104,7 @@ def open_catalog(settings, catalog_path: Path) -> None:
     if not executable or not executable.is_file():
         raise FileNotFoundError("Configure lightroom_executable com o Lightroom.exe correto")
     log.info("Abrindo Lightroom com catálogo %s", catalog_path)
-    subprocess.Popen(
-        [str(executable), str(catalog_path)],
-        cwd=str(executable.parent),
-        close_fds=True,
-    )
+    subprocess.Popen([str(executable), str(catalog_path)], cwd=str(executable.parent), close_fds=True)
     (settings.control_dir / "agent_open_catalog.txt").write_text(str(catalog_path), encoding="utf-8")
 
 
@@ -121,12 +116,11 @@ def ensure_correct_catalog(settings) -> None:
     running = bool(_lightroom_processes())
     last_opened = _active_catalog_hint(settings)
     same_catalog = last_opened is not None and last_opened.resolve() == desired.resolve()
-
     if running and same_catalog:
         return
 
     if running:
-        log.info("Catálogo desejado mudou: %s -> %s", last_opened, desired)
+        log.info("Troca de catálogo: %s -> %s", last_opened, desired)
         if not close_lightroom():
             raise RuntimeError("Não foi possível encerrar o Lightroom para trocar o catálogo")
         time.sleep(3)
@@ -141,13 +135,19 @@ def run_forever(config_path: str | Path = "config.json") -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    log.info("Agente de sessão iniciado")
-    while True:
-        try:
-            ensure_correct_catalog(settings)
-        except Exception:
-            log.exception("Falha ao garantir o catálogo correto")
-        time.sleep(15)
+    store = JobStore(settings)
+    scheduler = HomePiczScheduler(settings, store)
+    scheduler.start()
+    log.info("Agente iniciado: scheduler Home Picz + controle do Lightroom")
+    try:
+        while True:
+            try:
+                ensure_correct_catalog(settings)
+            except Exception:
+                log.exception("Falha ao garantir o catálogo correto")
+            time.sleep(15)
+    finally:
+        scheduler.stop()
 
 
 def main() -> None:
