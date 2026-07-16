@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import psutil
@@ -16,6 +18,7 @@ from .homepicz_scheduler import HomePiczScheduler
 from .store import JobStore
 
 log = logging.getLogger("lrautomatic.session_agent")
+CATALOG_POLL_SECONDS = 2
 
 
 def _lightroom_processes() -> list[psutil.Process]:
@@ -99,33 +102,50 @@ def _active_catalog_hint(settings) -> Path | None:
     return Path(raw) if raw else None
 
 
+def _write_startup_state(settings, **values: object) -> None:
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        **values,
+    }
+    (settings.control_dir / "startup_flow.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 def open_catalog(settings, catalog_path: Path) -> None:
     executable = settings.lightroom_executable
     if not executable or not executable.is_file():
         raise FileNotFoundError("Configure lightroom_executable com o Lightroom.exe correto")
     log.info("Abrindo Lightroom com catálogo %s", catalog_path)
+    _write_startup_state(settings, status="opening_lightroom", catalog_path=str(catalog_path))
     subprocess.Popen([str(executable), str(catalog_path)], cwd=str(executable.parent), close_fds=True)
     (settings.control_dir / "agent_open_catalog.txt").write_text(str(catalog_path), encoding="utf-8")
 
 
-def ensure_correct_catalog(settings) -> None:
+def ensure_correct_catalog(settings) -> bool:
+    """Abre ou troca para o catálogo solicitado.
+
+    Retorna True quando uma nova instância do Lightroom foi aberta neste ciclo.
+    """
     desired = _desired_catalog(settings)
     if not desired:
-        return
+        return False
 
     running = bool(_lightroom_processes())
     last_opened = _active_catalog_hint(settings)
     same_catalog = last_opened is not None and last_opened.resolve() == desired.resolve()
     if running and same_catalog:
-        return
+        return False
 
     if running:
         log.info("Troca de catálogo: %s -> %s", last_opened, desired)
+        _write_startup_state(settings, status="switching_catalog", catalog_path=str(desired))
         if not close_lightroom():
             raise RuntimeError("Não foi possível encerrar o Lightroom para trocar o catálogo")
         time.sleep(3)
 
     open_catalog(settings, desired)
+    return True
 
 
 def run_forever(config_path: str | Path = "config.json") -> None:
@@ -138,14 +158,37 @@ def run_forever(config_path: str | Path = "config.json") -> None:
     store = JobStore(settings)
     scheduler = HomePiczScheduler(settings, store)
     scheduler.start()
-    log.info("Agente iniciado: scheduler Home Picz + controle do Lightroom")
+    _write_startup_state(settings, status="checking_homepicz_now")
+    log.info(
+        "Agente iniciado: verificação Home Picz imediata; catálogo será conferido a cada %ss",
+        CATALOG_POLL_SECONDS,
+    )
+
+    lightroom_seen = bool(_lightroom_processes())
     try:
         while True:
             try:
-                ensure_correct_catalog(settings)
+                opened_now = ensure_correct_catalog(settings)
+                running_now = bool(_lightroom_processes())
+                if opened_now:
+                    _write_startup_state(
+                        settings,
+                        status="lightroom_opened_waiting_plugin",
+                        message="O plugin deve consumir a fila automaticamente em poucos segundos.",
+                    )
+                    log.info("Lightroom aberto; aguardando o plugin consumir a fila automaticamente")
+                elif running_now and not lightroom_seen:
+                    _write_startup_state(
+                        settings,
+                        status="lightroom_detected_waiting_plugin",
+                        message="O plugin deve consumir a fila automaticamente em poucos segundos.",
+                    )
+                    log.info("Lightroom detectado; o plugin deve iniciar a importação em poucos segundos")
+                lightroom_seen = running_now
             except Exception:
+                _write_startup_state(settings, status="failed", error="Consulte session-agent.log")
                 log.exception("Falha ao garantir o catálogo correto")
-            time.sleep(15)
+            time.sleep(CATALOG_POLL_SECONDS)
     finally:
         scheduler.stop()
 
