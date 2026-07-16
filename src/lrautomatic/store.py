@@ -38,7 +38,9 @@ class JobStore:
         ]
         job = ImportJob(request=request, progress=progress)
         if request.build_smart_previews:
-            job.smart_previews_status = "requested_but_sdk_not_supported"
+            job.smart_previews_status = "requested"
+        if request.develop_preset_name or request.develop_preset_uuid:
+            job.preset_status = "requested"
         self.save(job)
         return job
 
