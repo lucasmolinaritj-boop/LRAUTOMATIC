@@ -126,22 +126,6 @@ local function collectFiles(folder, recursive)
     return result
 end
 
-local function findOrCreateCollection(catalog, name, setName)
-    if not name or name == '' then return nil end
-    local parent = nil
-    if setName and setName ~= '' then
-        for _, set in ipairs(catalog:getChildCollectionSets()) do
-            if set:getName() == setName then parent = set break end
-        end
-        if not parent then parent = catalog:createCollectionSet(setName, nil, true) end
-    end
-    local collections = parent and parent:getChildCollections() or catalog:getChildCollections()
-    for _, collection in ipairs(collections) do
-        if collection:getName() == name then return collection end
-    end
-    return catalog:createCollection(name, parent, true)
-end
-
 local function refreshTotals(job)
     job.total_discovered, job.total_imported, job.total_skipped, job.total_failed = 0, 0, 0, 0
     for _, progress in ipairs(job.progress or {}) do
@@ -152,7 +136,43 @@ local function refreshTotals(job)
     end
 end
 
-local function prepareSource(job, source, progress, jobPath)
+local function findCollection(catalog, name)
+    for _, collection in ipairs(catalog:getChildCollections()) do
+        if collection:getName() == name then return collection end
+    end
+    return nil
+end
+
+local function ensureCollection(catalog, name)
+    if not name or name == '' then return nil end
+    local existing = findCollection(catalog, name)
+    if existing then return existing end
+    catalog:withWriteAccessDo('LRAutomatic: criar coleção', function()
+        catalog:createCollection(name, nil, true)
+    end)
+    return findCollection(catalog, name)
+end
+
+local function importOne(catalog, photoPath)
+    plainLog('ADD_PHOTO_BEGIN path=' .. tostring(photoPath))
+    local before = catalog:findPhotoByPath(photoPath)
+    if before then
+        plainLog('ADD_PHOTO_SKIP_ALREADY_EXISTS path=' .. tostring(photoPath) .. ' photo=' .. tostring(before))
+        return before, 'skipped'
+    end
+
+    local importedPhoto = nil
+    catalog:withWriteAccessDo('LRAutomatic: importar foto', function()
+        importedPhoto = catalog:addPhoto(photoPath)
+    end)
+
+    local after = importedPhoto or catalog:findPhotoByPath(photoPath)
+    plainLog('ADD_PHOTO_END path=' .. tostring(photoPath) .. ' returned=' .. tostring(importedPhoto) .. ' found_after=' .. tostring(after))
+    if after then return after, 'imported' end
+    return nil, 'failed'
+end
+
+local function processSource(catalog, job, source, progress, jobPath)
     progress.status = 'running'
     job.current_source = source.path
     local recursive = source.recursive
@@ -162,34 +182,48 @@ local function prepareSource(job, source, progress, jobPath)
     refreshTotals(job)
     writeJson(jobPath, job)
     plainLog('Encontradas ' .. tostring(#files) .. ' fotos em ' .. tostring(source.path))
-    return files
-end
 
-local function importSourceInsideWrite(catalog, job, source, progress, files)
+    local addedPhotos = {}
+    for _, photoPath in ipairs(files) do
+        local photo, result = importOne(catalog, photoPath)
+        if result == 'imported' then
+            progress.imported = progress.imported + 1
+            table.insert(addedPhotos, photo)
+        elseif result == 'skipped' then
+            progress.skipped = progress.skipped + 1
+            table.insert(addedPhotos, photo)
+        else
+            progress.failed = progress.failed + 1
+            progress.error = 'A foto não apareceu no catálogo após addPhoto: ' .. tostring(photoPath)
+        end
+        refreshTotals(job)
+        writeJson(jobPath, job)
+    end
+
     local collectionName = source.collection
     if not collectionName or collectionName == '' then collectionName = LrPathUtils.leafName(source.path) end
-
-    local collection = nil
-    if job.request.create_collections ~= false then
-        collection = findOrCreateCollection(catalog, collectionName, job.request.collection_set)
-    end
-
-    for _, photoPath in ipairs(files) do
-        local existing = catalog:findPhotoByPath(photoPath)
-        if existing then
-            progress.skipped = progress.skipped + 1
-            if collection then collection:addPhotos({ existing }) end
+    if job.request.create_collections ~= false and #addedPhotos > 0 then
+        local collection = ensureCollection(catalog, collectionName)
+        if collection then
+            catalog:withWriteAccessDo('LRAutomatic: adicionar à coleção', function()
+                collection:addPhotos(addedPhotos)
+            end)
+            plainLog('COLLECTION_ADD name=' .. tostring(collectionName) .. ' count=' .. tostring(#addedPhotos))
         else
-            local importedPhoto = catalog:addPhoto(photoPath)
-            if importedPhoto then
-                progress.imported = progress.imported + 1
-                if collection then collection:addPhotos({ importedPhoto }) end
-            else
-                progress.failed = progress.failed + 1
-                progress.error = 'catalog:addPhoto retornou nil para ' .. tostring(photoPath)
-            end
+            progress.failed = progress.failed + #addedPhotos
+            progress.error = 'Não foi possível criar ou localizar a coleção ' .. tostring(collectionName)
         end
     end
+
+    local accounted = (progress.imported or 0) + (progress.skipped or 0) + (progress.failed or 0)
+    if accounted ~= (progress.discovered or 0) then
+        progress.failed = (progress.failed or 0) + math.abs((progress.discovered or 0) - accounted)
+        progress.error = 'Totais inconsistentes: discovered=' .. tostring(progress.discovered) .. ' accounted=' .. tostring(accounted)
+    end
+
+    progress.status = (progress.failed or 0) > 0 and 'failed' or 'completed'
+    refreshTotals(job)
+    writeJson(jobPath, job)
 end
 
 local function processJob(jobPath, job)
@@ -202,37 +236,25 @@ local function processJob(jobPath, job)
     writeJson(jobPath, job)
     plainLog('Iniciando job ' .. tostring(job.job_id or jobPath) .. ' no catálogo ' .. tostring(job.active_catalog_path))
 
-    local prepared = {}
+    local anyFailed = false
     for index, source in ipairs((job.request and job.request.sources) or {}) do
         local progress = job.progress and job.progress[index]
         if progress then
-            prepared[index] = prepareSource(job, source, progress, jobPath)
+            processSource(catalog, job, source, progress, jobPath)
+            if progress.status == 'failed' then anyFailed = true end
         end
-    end
-
-    -- IMPORTANT: no pcall, yield or sleep may wrap/cross this call in Lua 5.1.
-    catalog:withWriteAccessDo('LRAutomatic: importar job', function()
-        for index, source in ipairs((job.request and job.request.sources) or {}) do
-            local progress = job.progress and job.progress[index]
-            if progress then
-                importSourceInsideWrite(catalog, job, source, progress, prepared[index] or {})
-            end
-        end
-    end, { timeout = 30 })
-
-    local anyFailed = false
-    for _, progress in ipairs(job.progress or {}) do
-        progress.status = (progress.failed or 0) > 0 and 'failed' or 'completed'
-        if progress.status == 'failed' then anyFailed = true end
     end
 
     refreshTotals(job)
     job.current_source = nil
     if anyFailed and job.total_imported > 0 then job.status = 'partial'
     elseif anyFailed then job.status = 'failed'
+    elseif job.total_discovered ~= (job.total_imported + job.total_skipped + job.total_failed) then
+        job.status = 'failed'
+        job.error = 'Totais finais inconsistentes'
     else job.status = 'completed' end
     writeJson(jobPath, job)
-    plainLog('Job finalizado: ' .. tostring(job.job_id) .. ' status=' .. tostring(job.status))
+    plainLog('Job finalizado: ' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) .. ' discovered=' .. tostring(job.total_discovered) .. ' imported=' .. tostring(job.total_imported) .. ' skipped=' .. tostring(job.total_skipped) .. ' failed=' .. tostring(job.total_failed))
     return true
 end
 
@@ -267,7 +289,7 @@ end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V3.1 Task-Safe iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V3.2 Import Verified iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
         Runner.processQueuedOnce()
