@@ -147,9 +147,11 @@ local function ensureCollection(catalog, name)
     if not name or name == '' then return nil end
     local existing = findCollection(catalog, name)
     if existing then return existing end
+    plainLog('WRITE_WAIT_BEGIN action=create_collection name=' .. tostring(name))
     catalog:withWriteAccessDo('LRAutomatic: criar coleção', function()
         catalog:createCollection(name, nil, true)
-    end)
+    end, { timeout = 30 })
+    plainLog('WRITE_WAIT_END action=create_collection name=' .. tostring(name))
     return findCollection(catalog, name)
 end
 
@@ -162,9 +164,11 @@ local function importOne(catalog, photoPath)
     end
 
     local importedPhoto = nil
+    plainLog('WRITE_WAIT_BEGIN action=import_photo path=' .. tostring(photoPath))
     catalog:withWriteAccessDo('LRAutomatic: importar foto', function()
         importedPhoto = catalog:addPhoto(photoPath)
-    end)
+    end, { timeout = 30 })
+    plainLog('WRITE_WAIT_END action=import_photo path=' .. tostring(photoPath))
 
     local after = importedPhoto or catalog:findPhotoByPath(photoPath)
     plainLog('ADD_PHOTO_END path=' .. tostring(photoPath) .. ' returned=' .. tostring(importedPhoto) .. ' found_after=' .. tostring(after))
@@ -205,9 +209,11 @@ local function processSource(catalog, job, source, progress, jobPath)
     if job.request.create_collections ~= false and #addedPhotos > 0 then
         local collection = ensureCollection(catalog, collectionName)
         if collection then
+            plainLog('WRITE_WAIT_BEGIN action=collection_add name=' .. tostring(collectionName))
             catalog:withWriteAccessDo('LRAutomatic: adicionar à coleção', function()
                 collection:addPhotos(addedPhotos)
-            end)
+            end, { timeout = 30 })
+            plainLog('WRITE_WAIT_END action=collection_add name=' .. tostring(collectionName))
             plainLog('COLLECTION_ADD name=' .. tostring(collectionName) .. ' count=' .. tostring(#addedPhotos))
         else
             progress.failed = progress.failed + #addedPhotos
@@ -289,7 +295,7 @@ end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V3.2 Import Verified iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V3.3 Write Wait iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
         Runner.processQueuedOnce()
