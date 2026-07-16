@@ -32,18 +32,25 @@ if errorlevel 1 goto :fail
 if errorlevel 1 goto :fail
 
 set "AGENT_CMD=\"%CD%\.venv\Scripts\pythonw.exe\" -m lrautomatic.session_agent \"%CD%\config.json\""
+
+rem Recria a tarefa para garantir que exista apenas uma instancia gerenciada.
+schtasks /End /TN "LRAutomatic Session Agent" >nul 2>&1
 schtasks /Create /TN "LRAutomatic Session Agent" /SC ONLOGON /RL HIGHEST /TR "%AGENT_CMD%" /F
 if errorlevel 1 goto :fail
 
-start "LRAutomatic Session Agent" "%CD%\.venv\Scripts\pythonw.exe" -m lrautomatic.session_agent "%CD%\config.json"
+rem Executa agora; nao espera novo logon nem reinicializacao.
+schtasks /Run /TN "LRAutomatic Session Agent"
+if errorlevel 1 goto :fail
 
 echo.
 echo ================================================
 echo  LRAutomatic instalado com sucesso
- echo  - Servico: API + agendador a cada 30 minutos
- echo  - Logon: agente que troca/abre o catalogo correto
- echo  - Lightroom fecha com seguranca antes da troca
- echo ================================================
+echo  - Servico da API iniciado agora e no Windows
+echo  - Home Picz faz a primeira verificacao imediatamente
+echo  - Novas verificacoes seguem o intervalo do config.json
+echo  - Agente de sessao abre ou troca o catalogo correto
+echo  - Uma unica instancia do agente fica ativa
+echo ================================================
 pause
 exit /b 0
 
