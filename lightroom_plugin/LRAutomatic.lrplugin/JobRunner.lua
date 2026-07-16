@@ -1,9 +1,9 @@
 local LrApplication = import 'LrApplication'
 local LrFileUtils = import 'LrFileUtils'
-local LrJson = import 'LrJson'
 local LrLogger = import 'LrLogger'
 local LrPathUtils = import 'LrPathUtils'
 local LrTasks = import 'LrTasks'
+local Json = require 'Json'
 
 local Runner = {}
 local logger = LrLogger('LRAutomatic')
@@ -57,14 +57,16 @@ end
 local function readJson(path)
     local content = LrFileUtils.readFile(path)
     if not content then return nil, 'arquivo não pôde ser lido' end
-    local ok, decoded = pcall(LrJson.decode, content)
+    local ok, decoded = pcall(Json.decode, content)
     if not ok then return nil, tostring(decoded) end
     return decoded, nil
 end
 
 local function writeJson(path, value)
     local temp = path .. '.tmp'
-    local okWrite = LrFileUtils.writeFile(temp, LrJson.encode(value))
+    local okEncode, encoded = pcall(Json.encode, value)
+    if not okEncode then error('não foi possível serializar JSON: ' .. tostring(encoded)) end
+    local okWrite = LrFileUtils.writeFile(temp, encoded)
     if not okWrite then error('não foi possível gravar ' .. temp) end
     if LrFileUtils.exists(path) then LrFileUtils.delete(path) end
     local moved = LrFileUtils.move(temp, path)
@@ -243,7 +245,7 @@ end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V2.5 iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V2.6 iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\nloop=running\njobs=' .. jobsDir())
         local ok, err = pcall(Runner.processQueuedOnce)
