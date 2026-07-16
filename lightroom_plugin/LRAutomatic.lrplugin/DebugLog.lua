@@ -6,12 +6,32 @@ local DebugLog = {}
 local sdkLogger = LrLogger('LRAutomaticV2')
 sdkLogger:enable('logfile')
 
+-- Lightroom Classic 10.4 uses a restricted Lua runtime where os.getenv may be nil.
+-- Build the same Windows path used by the Python service without environment access:
+-- C:\Users\<user>\AppData\Local\LRAutomatic
 local function dataDir()
-    local base = os.getenv('LOCALAPPDATA')
-    if not base or base == '' then
-        base = LrPathUtils.getStandardFilePath('appData')
+    local home = LrPathUtils.getStandardFilePath('home')
+    if home and home ~= '' then
+        return LrPathUtils.child(
+            LrPathUtils.child(
+                LrPathUtils.child(home, 'AppData'),
+                'Local'
+            ),
+            'LRAutomatic'
+        )
     end
-    return LrPathUtils.child(base, 'LRAutomatic')
+
+    -- Last-resort SDK-only fallback. This may resolve to Roaming, but keeps the
+    -- plugin alive and produces a diagnostic log instead of aborting at startup.
+    local appData = LrPathUtils.getStandardFilePath('appData')
+    if not appData or appData == '' then
+        error('Lightroom SDK não forneceu home nem appData')
+    end
+    return LrPathUtils.child(appData, 'LRAutomatic')
+end
+
+function DebugLog.dataDir()
+    return dataDir()
 end
 
 function DebugLog.logsDir()
@@ -25,7 +45,8 @@ end
 local function append(path, line)
     LrFileUtils.createAllDirectories(LrPathUtils.parent(path))
     local old = LrFileUtils.readFile(path) or ''
-    LrFileUtils.writeFile(path, old .. line .. '\n')
+    local ok = LrFileUtils.writeFile(path, old .. line .. '\n')
+    if not ok then error('não foi possível gravar log em ' .. tostring(path)) end
 end
 
 function DebugLog.write(level, event, detail)
@@ -49,7 +70,9 @@ function DebugLog.error(event, detail) DebugLog.write('ERROR', event, detail) en
 function DebugLog.writeState(name, content)
     local ok, err = pcall(function()
         LrFileUtils.createAllDirectories(DebugLog.stateDir())
-        LrFileUtils.writeFile(LrPathUtils.child(DebugLog.stateDir(), name), tostring(content or ''))
+        local path = LrPathUtils.child(DebugLog.stateDir(), name)
+        local written = LrFileUtils.writeFile(path, tostring(content or ''))
+        if not written then error('não foi possível gravar estado em ' .. tostring(path)) end
     end)
     if not ok then DebugLog.error('state_write_failed', tostring(err)) end
 end
