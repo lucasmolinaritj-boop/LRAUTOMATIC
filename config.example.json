@@ -1,0 +1,9 @@
+{
+  "host": "127.0.0.1",
+  "port": 45821,
+  "api_key": "TROQUE-POR-UMA-CHAVE-GRANDE-E-ALEATORIA",
+  "data_dir": "%LOCALAPPDATA%\\LRAutomatic",
+  "catalog_template": null,
+  "catalog_output_root": null,
+  "lightroom_executable": null
+}
