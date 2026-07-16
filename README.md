@@ -1,23 +1,22 @@
 # LRAutomatic
 
-Automação local do Adobe Lightroom Classic por **CLI + API HTTP + plugin Lua**.
+Automação local do Adobe Lightroom Classic por **aplicativo desktop + CLI + API HTTP + plugin Lua**.
 
-O Lightroom permanece aberto com o plugin instalado. O serviço Python recebe tarefas, grava uma fila persistente em disco e o plugin importa as fotos no catálogo atualmente aberto. Uma única tarefa pode conter várias pastas.
+O Lightroom permanece aberto com o plugin instalado. O serviço Python recebe tarefas, grava uma fila persistente em disco e o plugin importa as fotos no catálogo. Uma tarefa pode conter várias pastas.
 
-> Estado: MVP inicial. A importação por `catalog:addPhoto()` está implementada. A criação de Smart Previews e a troca de catálogo não possuem uma API pública estável no Lightroom SDK e, por isso, aparecem como capacidades pendentes, sem fingir que foram executadas.
+## Recursos atuais
 
-## Recursos
-
+- Aplicativo desktop com criação de catálogo e ZIP de diagnóstico.
+- Criação de catálogo pelo app a partir de um catálogo-modelo oficial vazio.
+- Abertura automática do novo catálogo no Lightroom.
 - Importação de múltiplas pastas em um comando.
 - API local com autenticação por chave.
-- Fila persistente e retomada após reiniciar o serviço.
-- Uma coleção por pasta, opcional.
-- Coleção-conjunto por tarefa, opcional.
-- Busca recursiva.
-- Filtro de extensões RAW/JPEG/TIFF/HEIC/DNG.
-- Status geral e detalhado por pasta.
-- Plugin Lightroom Classic em Lua.
-- Preparação para catálogo-modelo, que pode ser configurado depois.
+- Fila persistente e retomada.
+- Coleção por pasta e conjunto de coleções opcional.
+- Detecção de fotos já importadas.
+- Solicitação de Smart Previews pelo próprio Lightroom após a importação.
+- Logs do serviço, plugin e automação de Smart Previews.
+- ZIP sanitizado para depuração, sem incluir a chave da API.
 
 ## Requisitos
 
@@ -25,55 +24,57 @@ O Lightroom permanece aberto com o plugin instalado. O serviço Python recebe ta
 - Adobe Lightroom Classic.
 - Python 3.11 ou superior.
 
-## Instalação do serviço
+## Instalação
+
+Execute:
 
 ```bat
-py -m venv .venv
-.venv\Scripts\activate
-pip install -e .
-copy config.example.json config.json
+instalar.bat
 ```
 
-Edite `config.json` e troque `api_key`.
+Depois configure `config.json`:
 
-Inicie o serviço:
+```json
+{
+  "host": "127.0.0.1",
+  "port": 45821,
+  "api_key": "SUA-CHAVE",
+  "data_dir": "%LOCALAPPDATA%\\LRAutomatic",
+  "catalog_template": "D:\\Modelos\\CatalogoModelo.lrcat",
+  "catalog_output_root": "D:\\Catalogos",
+  "lightroom_executable": "C:\\Program Files\\Adobe\\Adobe Lightroom Classic\\Lightroom.exe"
+}
+```
+
+O catálogo-modelo pode ser colocado depois. Ele deve ser um catálogo vazio criado uma única vez pelo próprio Lightroom. A partir daí, o app cria e nomeia todos os novos catálogos automaticamente.
+
+## Abrir o aplicativo
 
 ```bat
-lrautomatic serve
+abrir_app.bat
 ```
 
-A API ficará em `http://127.0.0.1:45821`.
+No aplicativo existem os botões:
 
-## Instalação do plugin
+- **Criar e abrir no Lightroom**
+- **Gerar ZIP de diagnóstico**
 
-1. Copie a pasta `lightroom_plugin/LRAutomatic.lrplugin` para um local permanente.
-2. No Lightroom Classic, abra **Arquivo > Gerenciador de plug-ins**.
-3. Clique em **Adicionar** e selecione `LRAutomatic.lrplugin`.
-4. Mantenha o Lightroom aberto no catálogo que receberá as fotos.
+## Instalar o plugin
 
-Por padrão, serviço e plugin usam:
+1. Abra **Arquivo > Gerenciador de plug-ins** no Lightroom Classic.
+2. Clique em **Adicionar**.
+3. Selecione `lightroom_plugin\LRAutomatic.lrplugin`.
+4. Reinicie o Lightroom após atualizar arquivos do plugin.
 
-```text
-%LOCALAPPDATA%\LRAutomatic
-```
-
-## Importar múltiplas pastas pelo CMD
-
-```bat
-lrautomatic import ^
-  --source "E:\Imovel_101" ^
-  --source "E:\Imovel_102" ^
-  --source "F:\Apartamento_220" ^
-  --collection-set "Trabalhos 16-07-2026" ^
-  --recursive
-```
-
-Com nomes de coleção personalizados:
+## Importar múltiplas pastas
 
 ```bat
 lrautomatic import ^
   --source "E:\Imovel_101|Casa 101" ^
-  --source "E:\Imovel_102|Casa 102"
+  --source "E:\Imovel_102|Casa 102" ^
+  --collection-set "Trabalhos Julho 2026" ^
+  --recursive ^
+  --smart-previews
 ```
 
 Por JSON:
@@ -82,33 +83,66 @@ Por JSON:
 lrautomatic import --job examples\import-job.json
 ```
 
-Consultar:
+Consultar tarefas:
 
 ```bat
 lrautomatic jobs
 lrautomatic status JOB_ID
 ```
 
+## Criar catálogo pelo CMD
+
+```bat
+lrautomatic catalog-create --name "Imovel 582"
+```
+
+O app cria uma pasta própria para o trabalho, copia o catálogo-modelo para o nome definitivo e abre o Lightroom apontando diretamente para esse catálogo.
+
+## Smart Previews
+
+Quando `--smart-previews` estiver ativo, o plugin:
+
+1. importa as fotos usando o SDK;
+2. seleciona somente as fotos recém-importadas;
+3. chama um script PowerShell;
+4. o script ativa o Lightroom e solicita **Criar visualizações inteligentes** pela interface;
+5. o próprio Lightroom gera os arquivos oficiais.
+
+Como a Adobe não expõe essa operação no SDK público, essa etapa usa automação da interface. Ela pode precisar de ajuste conforme idioma e versão. Todos os resultados ficam em:
+
+```text
+%LOCALAPPDATA%\LRAutomatic\logs\smart-previews.log
+```
+
+A sequência de teclas pode ser sobrescrita pela variável:
+
+```bat
+set LRAUTOMATIC_SMART_PREVIEW_KEYS=SEQUENCIA
+```
+
+## ZIP de diagnóstico
+
+Pelo aplicativo, clique em **Gerar ZIP de diagnóstico**.
+
+Ou pelo CMD:
+
+```bat
+lrautomatic diagnostic-zip --output "%USERPROFILE%\Desktop"
+```
+
+O ZIP inclui:
+
+- informações do Windows e Python;
+- dependências instaladas;
+- processos em execução;
+- configuração com segredos removidos;
+- até 100 arquivos recentes de tarefas, respostas, controles e logs;
+- log do plugin;
+- log da geração de Smart Previews.
+
+Ele não inclui suas fotos, catálogo `.lrcat` ou chave da API.
+
 ## API
-
-```http
-POST /api/v1/import-jobs
-Authorization: Bearer SUA_CHAVE
-Content-Type: application/json
-```
-
-```json
-{
-  "collection_set": "Trabalhos 16-07-2026",
-  "recursive": true,
-  "sources": [
-    {"path": "E:\\Imovel_101", "collection": "Casa 101"},
-    {"path": "E:\\Imovel_102", "collection": "Casa 102"}
-  ]
-}
-```
-
-Endpoints:
 
 - `GET /health`
 - `POST /api/v1/import-jobs`
@@ -116,35 +150,11 @@ Endpoints:
 - `GET /api/v1/import-jobs/{job_id}`
 - `POST /api/v1/import-jobs/{job_id}/cancel`
 
-## Catálogo-modelo
+A API usa `Authorization: Bearer SUA_CHAVE`.
 
-Quando você colocar um catálogo vazio criado pelo próprio Lightroom, configure:
+## Observações importantes
 
-```json
-{
-  "catalog_template": "D:\\Modelos\\CatalogoModelo.lrcat",
-  "catalog_output_root": "D:\\Catalogos"
-}
-```
-
-O comando reservado será:
-
-```bat
-lrautomatic catalog-create --name "Imovel 582"
-```
-
-Nesta primeira versão, ele copia o catálogo-modelo com segurança. A abertura/troca automática do Lightroom será adicionada após validar o caminho e a versão do executável na sua máquina.
-
-## Limites atuais importantes
-
-- O plugin importa no **catálogo atualmente aberto**.
 - O Lightroom aceita apenas um catálogo aberto por vez.
-- Smart Preview oficial deve ser criado pelo próprio Lightroom. O SDK público não expõe uma chamada estável para isso; a flag é registrada como solicitação pendente.
-- Não há escrita direta no SQLite `.lrcat`.
-
-## Segurança
-
-- API vinculada somente a `127.0.0.1` por padrão.
-- Chave Bearer obrigatória nos endpoints de alteração/consulta.
-- Escrita atômica dos arquivos JSON.
-- O plugin só lê tarefas da pasta local configurada.
+- A criação do `.lrcat` usa um catálogo-modelo oficial porque o SDK público não cria um catálogo vazio do zero.
+- Smart Preview é gerado pelo Lightroom, mas o acionamento é feito por automação de interface e deve ser validado na instalação real.
+- O projeto não escreve diretamente no SQLite interno do catálogo.
