@@ -100,12 +100,26 @@ def cancel(job_id: str, config: str = typer.Option("config.json")) -> None:
 
 @app.command("catalog-create")
 def catalog_create(
-    name: str = typer.Option(..., help="Nome do novo catálogo"),
+    name: str | None = typer.Option(None, help="Nome manual. Omitindo, usa o modelo configurado, como 16072026 scout"),
+    source: list[Path] = typer.Option(None, "--source", "-s", exists=True, file_okay=False, help="Pasta de fotos usada para detectar a primeira data"),
+    catalog_date: str | None = typer.Option(None, "--date", help="Força a data: DDMMAAAA, DD/MM/AAAA ou AAAA-MM-DD"),
+    label: str | None = typer.Option(None, help="Valor do token {label} no modelo de nome"),
+    recursive: bool = typer.Option(True, "--recursive/--no-recursive", help="Inclui subpastas ao procurar a primeira data"),
     open_lightroom: bool = typer.Option(True, "--open-lightroom/--no-open-lightroom"),
     config: str = typer.Option("config.json"),
 ) -> None:
-    result = create_catalog(load_settings(config), name, open_lightroom=open_lightroom)
+    result = create_catalog(
+        load_settings(config),
+        name,
+        source_paths=[str(path) for path in (source or [])],
+        catalog_date=catalog_date,
+        label=label,
+        recursive=recursive,
+        open_lightroom=open_lightroom,
+    )
     typer.echo(json.dumps({
+        "catalog_name": result.catalog_name,
+        "catalog_date": result.catalog_date.isoformat(),
         "catalog_path": str(result.catalog_path),
         "catalog_dir": str(result.catalog_dir),
         "launched": result.launched,
