@@ -15,20 +15,43 @@ local SUPPORTED = {
     tif=true, tiff=true,
 }
 
-local function dataDir()
-    local base = os.getenv('LOCALAPPDATA')
-    if not base or base == '' then base = LrPathUtils.getStandardFilePath('appData') end
-    return LrPathUtils.child(base, 'LRAutomatic')
+local function homePath()
+    local home = LrPathUtils.getStandardFilePath('home')
+    if home and home ~= '' then return home end
+    return 'C:\\Users\\Public'
 end
+
+local function dataDir()
+    return LrPathUtils.child(
+        LrPathUtils.child(
+            LrPathUtils.child(homePath(), 'AppData'),
+            'Local'
+        ),
+        'LRAutomatic'
+    )
+end
+
 local function jobsDir() return LrPathUtils.child(dataDir(), 'jobs') end
 local function logsDir() return LrPathUtils.child(dataDir(), 'logs') end
+local function stateDir() return LrPathUtils.child(dataDir(), 'plugin_state') end
+
+local function appendFile(path, text)
+    LrFileUtils.createAllDirectories(LrPathUtils.parent(path))
+    local old = LrFileUtils.readFile(path) or ''
+    LrFileUtils.writeFile(path, old .. tostring(text) .. '\n')
+end
 
 local function plainLog(message)
-    LrFileUtils.createAllDirectories(logsDir())
-    local path = LrPathUtils.child(logsDir(), 'plugin.log')
-    local old = LrFileUtils.readFile(path) or ''
-    LrFileUtils.writeFile(path, old .. os.date('!%Y-%m-%dT%H:%M:%SZ') .. ' ' .. tostring(message) .. '\n')
+    local line = os.date('!%Y-%m-%dT%H:%M:%SZ') .. ' ' .. tostring(message)
+    pcall(appendFile, LrPathUtils.child(logsDir(), 'plugin.log'), line)
     logger:info(tostring(message))
+end
+
+local function writeState(name, text)
+    pcall(function()
+        LrFileUtils.createAllDirectories(stateDir())
+        LrFileUtils.writeFile(LrPathUtils.child(stateDir(), name), tostring(text or ''))
+    end)
 end
 
 local function readJson(path)
@@ -48,10 +71,14 @@ local function writeJson(path, value)
     if not moved then error('não foi possível substituir ' .. path) end
 end
 
-local function extension(path) return string.lower(LrPathUtils.extension(path) or '') end
+local function extension(path)
+    return string.lower(LrPathUtils.extension(path) or '')
+end
 
 local function collectFiles(folder, recursive)
-    if not LrFileUtils.exists(folder) then error('pasta de origem não existe: ' .. tostring(folder)) end
+    if not LrFileUtils.exists(folder) then
+        error('pasta de origem não existe: ' .. tostring(folder))
+    end
     local result = {}
     local iterator = recursive and LrFileUtils.recursiveFiles(folder) or LrFileUtils.files(folder)
     for path in iterator do
@@ -92,26 +119,6 @@ local function externallyCancelled(jobPath)
     return latest and latest.status == 'cancelled'
 end
 
-local function quoteWindows(value) return '"' .. string.gsub(value, '"', '\\"') .. '"' end
-
-local function requestSmartPreviews(catalog, photos, progress)
-    if not photos or #photos == 0 then return true end
-    local selectedOk, selectedErr = pcall(function() catalog:setSelectedPhotos(photos[1], photos) end)
-    if not selectedOk then
-        progress.smart_previews_status = 'selection_failed'
-        progress.smart_previews_error = tostring(selectedErr)
-        plainLog('Falha ao selecionar fotos para Smart Preview: ' .. tostring(selectedErr))
-        return false
-    end
-    local script = LrPathUtils.child(_PLUGIN.path, 'BuildSmartPreviews.ps1')
-    local command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' .. quoteWindows(script)
-    local exitCode = LrTasks.execute(command)
-    progress.smart_previews_exit_code = exitCode
-    progress.smart_previews_status = exitCode == 0 and 'requested' or 'failed'
-    if exitCode ~= 0 then progress.smart_previews_error = 'PowerShell retornou código ' .. tostring(exitCode) end
-    return exitCode == 0
-end
-
 local function processSource(catalog, job, source, progress, jobPath)
     progress.status = 'running'
     job.current_source = source.path
@@ -134,13 +141,13 @@ local function processSource(catalog, job, source, progress, jobPath)
         end)
     end
 
-    local importedPhotos = {}
     for _, photoPath in ipairs(files) do
         if externallyCancelled(jobPath) then
             job.status, progress.status = 'cancelled', 'cancelled'
             writeJson(jobPath, job)
             return
         end
+
         local existing = catalog:findPhotoByPath(photoPath)
         if existing then
             progress.skipped = progress.skipped + 1
@@ -154,22 +161,18 @@ local function processSource(catalog, job, source, progress, jobPath)
             end)
             if ok and importedPhoto then
                 progress.imported = progress.imported + 1
-                table.insert(importedPhotos, importedPhoto)
             else
                 progress.failed = progress.failed + 1
                 progress.error = tostring(err or 'Falha desconhecida ao importar')
                 plainLog('Falha ao importar ' .. photoPath .. ': ' .. progress.error)
             end
         end
+
         refreshTotals(job)
         writeJson(jobPath, job)
         LrTasks.yield()
     end
 
-    if job.request.build_smart_previews == true and #importedPhotos > 0 then
-        requestSmartPreviews(catalog, importedPhotos, progress)
-        writeJson(jobPath, job)
-    end
     progress.status = progress.failed > 0 and 'failed' or 'completed'
 end
 
@@ -182,8 +185,8 @@ local function processJob(jobPath, job)
     job.status, job.error = 'running', nil
     writeJson(jobPath, job)
     plainLog('Iniciando job ' .. tostring(job.job_id or jobPath) .. ' no catálogo ' .. tostring(job.active_catalog_path))
-    local anyFailed = false
 
+    local anyFailed = false
     for index, source in ipairs(job.request.sources or {}) do
         local progress = job.progress[index]
         if progress then
@@ -193,7 +196,9 @@ local function processJob(jobPath, job)
                 anyFailed = true
                 plainLog('Erro na origem ' .. tostring(source.path) .. ': ' .. tostring(err))
                 writeJson(jobPath, job)
-            elseif progress.status == 'failed' then anyFailed = true end
+            elseif progress.status == 'failed' then
+                anyFailed = true
+            end
         end
         if job.status == 'cancelled' then break end
     end
@@ -212,8 +217,10 @@ end
 
 function Runner.processQueuedOnce()
     LrFileUtils.createAllDirectories(jobsDir())
+    writeState('runner_alive.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\njobs=' .. jobsDir())
     local processed = 0
     plainLog('Procurando jobs em ' .. jobsDir())
+
     for path in LrFileUtils.files(jobsDir()) do
         if extension(path) == 'json' and string.match(LrPathUtils.leafName(path), '^job_') then
             local job, readError = readJson(path)
@@ -225,7 +232,9 @@ function Runner.processQueuedOnce()
                     job.status, job.error = 'failed', tostring(result)
                     pcall(writeJson, path, job)
                     plainLog('Job falhou: ' .. tostring(result))
-                elseif result then processed = processed + 1 end
+                elseif result then
+                    processed = processed + 1
+                end
             end
         end
     end
@@ -234,8 +243,9 @@ end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin 0.2.0 LR 10.4 iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V2.5 iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
+        writeState('heartbeat.txt', os.date('!%Y-%m-%dT%H:%M:%SZ') .. '\nloop=running\njobs=' .. jobsDir())
         local ok, err = pcall(Runner.processQueuedOnce)
         if not ok then plainLog('Erro ao verificar fila: ' .. tostring(err)) end
         LrTasks.sleep(2)
