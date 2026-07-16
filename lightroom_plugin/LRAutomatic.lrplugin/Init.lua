@@ -2,46 +2,48 @@ local LrTasks = import 'LrTasks'
 
 _G.LRAutomaticShutdown = false
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '0.2.4-lr104-compatible'
+_G.LRAutomaticVersion = '0.2.6-lr104-hardened'
 _G.LRAutomaticLastError = nil
 
--- Keep top-level initialization deliberately tiny. Any failure below is trapped
--- inside the async task so Lightroom keeps the plug-in enabled and its menu items
--- remain registered.
+-- Keep top-level code minimal so menu registration is never blocked.
 LrTasks.startAsyncTask(function()
-    local okBootstrap, bootstrapError = pcall(function()
-        local LrPathUtils = import 'LrPathUtils'
+    local okDebug, Debug = pcall(require, 'DebugLog')
 
-        -- Lightroom 10.4's Lua sandbox may not expose os.getenv. JobRunner still
-        -- uses it, so provide a compatible value before loading that module.
-        if not os.getenv then
-            os.getenv = function(name)
-                if name == 'LOCALAPPDATA' then
-                    local home = LrPathUtils.getStandardFilePath('home')
-                    if home and home ~= '' then
-                        return LrPathUtils.child(
-                            LrPathUtils.child(
-                                LrPathUtils.child(home, 'AppData'),
-                                'Local'
-                            ),
-                            ''
-                        )
-                    end
-                end
-                return nil
-            end
+    local function logInfo(event, detail)
+        if okDebug and Debug then pcall(Debug.info, event, detail) end
+    end
+
+    local function logError(event, detail)
+        if okDebug and Debug then
+            pcall(Debug.error, event, detail)
+            pcall(Debug.writeState, 'fatal_error.txt', tostring(detail or ''))
         end
+    end
 
-        local Runner = require 'JobRunner'
-        _G.LRAutomaticLoopRunning = true
+    logInfo('automatic_bootstrap_start', _G.LRAutomaticVersion)
 
+    local okRequire, Runner = pcall(require, 'JobRunner')
+    if not okRequire then
+        _G.LRAutomaticLastError = tostring(Runner)
+        logError('automatic_jobrunner_require_failed', Runner)
+        return
+    end
+
+    _G.LRAutomaticLoopRunning = true
+    _G.LRAutomaticLastError = nil
+    logInfo('automatic_loop_start', tostring(Runner.getJobsDir()))
+
+    local okLoop, loopError = pcall(function()
         Runner.runLoop(function()
             return _G.LRAutomaticShutdown == true
         end)
     end)
 
     _G.LRAutomaticLoopRunning = false
-    if not okBootstrap then
-        _G.LRAutomaticLastError = tostring(bootstrapError)
+    if not okLoop then
+        _G.LRAutomaticLastError = tostring(loopError)
+        logError('automatic_loop_failed', loopError)
+    else
+        logInfo('automatic_loop_stopped', 'normal')
     end
 end)
