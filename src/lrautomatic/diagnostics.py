@@ -32,6 +32,18 @@ def _command_output(command: list[str]) -> str:
         return f'ERROR: {type(exc).__name__}: {exc}'
 
 
+def _copy_diagnostic_file(source: Path, destination: Path) -> None:
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.suffix.lower() == '.json':
+            data = json.loads(source.read_text(encoding='utf-8'))
+            destination.write_text(json.dumps(_redact(data), ensure_ascii=False, indent=2), encoding='utf-8')
+        else:
+            destination.write_bytes(source.read_bytes())
+    except Exception as exc:
+        destination.with_suffix(destination.suffix + '.error.txt').write_text(str(exc), encoding='utf-8')
+
+
 def create_diagnostic_zip(settings: Settings, config_path: str | Path = 'config.json', output_dir: Path | None = None) -> Path:
     output_dir = output_dir or Path.cwd()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -68,6 +80,12 @@ def create_diagnostic_zip(settings: Settings, config_path: str | Path = 'config.
             except Exception as exc:
                 (root / 'config_error.txt').write_text(str(exc), encoding='utf-8')
 
+        # Root-level traces are intentionally included because the Lightroom SDK may
+        # fail before the normal logs/ and plugin_state/ directories are usable.
+        if settings.data_dir.exists():
+            for source in sorted((p for p in settings.data_dir.iterdir() if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)[:50]:
+                _copy_diagnostic_file(source, root / 'data_root' / source.name)
+
         for folder_name in ('jobs', 'responses', 'control', 'logs', 'plugin_state'):
             source = settings.data_dir / folder_name
             if source.exists():
@@ -75,17 +93,7 @@ def create_diagnostic_zip(settings: Settings, config_path: str | Path = 'config.
                 target.mkdir(parents=True, exist_ok=True)
                 files = sorted((p for p in source.rglob('*') if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)[:200]
                 for file in files:
-                    rel = file.relative_to(source)
-                    dest = target / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        if file.suffix.lower() == '.json':
-                            data = json.loads(file.read_text(encoding='utf-8'))
-                            dest.write_text(json.dumps(_redact(data), ensure_ascii=False, indent=2), encoding='utf-8')
-                        else:
-                            dest.write_bytes(file.read_bytes())
-                    except Exception as exc:
-                        (dest.with_suffix(dest.suffix + '.error.txt')).write_text(str(exc), encoding='utf-8')
+                    _copy_diagnostic_file(file, target / file.relative_to(source))
 
         with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
             for file in root.rglob('*'):
