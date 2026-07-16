@@ -9,6 +9,7 @@ local Runner = {}
 local logger = LrLogger('LRAutomatic')
 logger:enable('logfile')
 
+local processing = false
 local SUPPORTED = {
     arw=true, cr2=true, cr3=true, dng=true, heic=true, heif=true,
     jpeg=true, jpg=true, nef=true, orf=true, raf=true, rw2=true,
@@ -31,8 +32,7 @@ local function stateDir() return LrPathUtils.child(dataDir(), 'plugin_state') en
 
 local function timestamp()
     local ok, value = pcall(os.date, '!%Y-%m-%dT%H:%M:%SZ')
-    if ok and value then return value end
-    return 'time-unavailable'
+    return (ok and value) or 'time-unavailable'
 end
 
 local function readText(path)
@@ -63,8 +63,7 @@ end
 
 local function hardTrace(message)
     LrFileUtils.createAllDirectories(dataDir())
-    local path = LrPathUtils.child(dataDir(), 'runner-trace.log')
-    appendText(path, timestamp() .. ' ' .. tostring(message) .. '\n')
+    appendText(LrPathUtils.child(dataDir(), 'runner-trace.log'), timestamp() .. ' ' .. tostring(message) .. '\n')
 end
 
 local function plainLog(message)
@@ -87,33 +86,22 @@ local function stripBom(content)
     return content
 end
 
-local function rawStringField(content, key)
-    return string.match(content, '"' .. key .. '"%s*:%s*"([^"]*)"')
-end
-
 local function readJson(path)
-    local content, readErr = readText(path)
-    if not content then return nil, 'arquivo não pôde ser lido: ' .. tostring(readErr), nil end
+    local content, err = readText(path)
+    if not content then return nil, 'arquivo não pôde ser lido: ' .. tostring(err) end
     content = stripBom(content)
-    local rawStatus = rawStringField(content, 'status')
     local ok, decoded = pcall(Json.decode, content)
-    if not ok then
-        plainLog('JSON decode falhou: ' .. tostring(decoded) .. ' rawStatus=' .. tostring(rawStatus))
-        return nil, tostring(decoded), rawStatus
-    end
-    if type(decoded) ~= 'table' then return nil, 'JSON raiz não é objeto', rawStatus end
-    if decoded.status == nil and rawStatus ~= nil then decoded.status = rawStatus end
-    return decoded, nil, rawStatus
+    if not ok then return nil, tostring(decoded) end
+    if type(decoded) ~= 'table' then return nil, 'JSON raiz não é objeto' end
+    return decoded, nil
 end
 
 local function writeJson(path, value)
     local temp = path .. '.tmp'
-    local encoded = Json.encode(value)
-    local okWrite, writeErr = writeText(temp, encoded)
-    if not okWrite then error('não foi possível gravar ' .. temp .. ': ' .. tostring(writeErr)) end
+    local ok, err = writeText(temp, Json.encode(value))
+    if not ok then error('não foi possível gravar ' .. temp .. ': ' .. tostring(err)) end
     if LrFileUtils.exists(path) then LrFileUtils.delete(path) end
-    local moved = LrFileUtils.move(temp, path)
-    if not moved then error('não foi possível substituir ' .. path) end
+    if not LrFileUtils.move(temp, path) then error('não foi possível substituir ' .. path) end
 end
 
 local function normalizedExtension(path)
@@ -164,11 +152,6 @@ local function refreshTotals(job)
     end
 end
 
-local function externallyCancelled(jobPath)
-    local latest = readJson(jobPath)
-    return latest and latest.status == 'cancelled'
-end
-
 local function processSource(catalog, job, source, progress, jobPath)
     progress.status = 'running'
     job.current_source = source.path
@@ -184,45 +167,43 @@ local function processSource(catalog, job, source, progress, jobPath)
 
     local collectionName = source.collection
     if not collectionName or collectionName == '' then collectionName = LrPathUtils.leafName(source.path) end
-    local collection = nil
-    if job.request.create_collections ~= false then
-        catalog:withWriteAccessDo('LRAutomatic: preparar coleção', function()
-            collection = findOrCreateCollection(catalog, collectionName, job.request.collection_set)
-        end)
-    end
 
-    for _, photoPath in ipairs(files) do
-        if externallyCancelled(jobPath) then
-            job.status, progress.status = 'cancelled', 'cancelled'
-            writeJson(jobPath, job)
-            return
-        end
-
-        local existing = catalog:findPhotoByPath(photoPath)
-        if existing then
-            progress.skipped = progress.skipped + 1
-        else
-            local importedPhoto = nil
-            local ok, err = pcall(function()
-                catalog:withWriteAccessDo('LRAutomatic: importar foto', function()
-                    importedPhoto = catalog:addPhoto(photoPath)
-                    if collection and importedPhoto then collection:addPhotos({ importedPhoto }) end
-                end)
-            end)
-            if ok and importedPhoto then
-                progress.imported = progress.imported + 1
-            else
-                progress.failed = progress.failed + 1
-                progress.error = tostring(err or 'Falha desconhecida ao importar')
-                plainLog('Falha ao importar ' .. photoPath .. ': ' .. progress.error)
+    local writeOk, writeErr = pcall(function()
+        catalog:withWriteAccessDo('LRAutomatic: importar pasta', function()
+            local collection = nil
+            if job.request.create_collections ~= false then
+                collection = findOrCreateCollection(catalog, collectionName, job.request.collection_set)
             end
-        end
+
+            for _, photoPath in ipairs(files) do
+                local existing = catalog:findPhotoByPath(photoPath)
+                if existing then
+                    progress.skipped = progress.skipped + 1
+                else
+                    local importedPhoto = catalog:addPhoto(photoPath)
+                    if importedPhoto then
+                        progress.imported = progress.imported + 1
+                        if collection then collection:addPhotos({ importedPhoto }) end
+                    else
+                        progress.failed = progress.failed + 1
+                        progress.error = 'catalog:addPhoto retornou nil para ' .. tostring(photoPath)
+                    end
+                end
+            end
+        end, { timeout = 30 })
+    end)
+
+    if not writeOk then
+        progress.status = 'failed'
+        progress.error = tostring(writeErr)
         refreshTotals(job)
         writeJson(jobPath, job)
-        LrTasks.yield()
+        error(writeErr)
     end
 
+    refreshTotals(job)
     progress.status = progress.failed > 0 and 'failed' or 'completed'
+    writeJson(jobPath, job)
 end
 
 local function processJob(jobPath, job)
@@ -249,38 +230,37 @@ local function processJob(jobPath, job)
                 anyFailed = true
             end
         end
-        if job.status == 'cancelled' then break end
     end
 
     refreshTotals(job)
     job.current_source = nil
-    if job.status ~= 'cancelled' then
-        if anyFailed and job.total_imported > 0 then job.status = 'partial'
-        elseif anyFailed then job.status = 'failed'
-        else job.status = 'completed' end
-    end
+    if anyFailed and job.total_imported > 0 then job.status = 'partial'
+    elseif anyFailed then job.status = 'failed'
+    else job.status = 'completed' end
     writeJson(jobPath, job)
     plainLog('Job finalizado: ' .. tostring(job.job_id) .. ' status=' .. tostring(job.status))
     return true
 end
 
 function Runner.processQueuedOnce()
-    LrFileUtils.createAllDirectories(jobsDir())
-    hardTrace('processQueuedOnce ENTER jobs=' .. jobsDir())
-    writeState('runner_alive.txt', timestamp() .. '\njobs=' .. jobsDir())
-    local processed, inspected = 0, 0
+    if processing then
+        plainLog('Fila já está sendo processada; chamada concorrente ignorada')
+        return 0
+    end
 
-    for path in LrFileUtils.files(jobsDir()) do
-        local leaf = LrPathUtils.leafName(path) or tostring(path)
-        hardTrace('ITER path=' .. tostring(path) .. ' leaf=' .. tostring(leaf))
-        if isJobFile(path) then
-            inspected = inspected + 1
-            local job, readError, rawStatus = readJson(path)
-            if not job then
-                plainLog('JSON inválido em ' .. path .. ': ' .. tostring(readError) .. ' rawStatus=' .. tostring(rawStatus))
-            else
-                plainLog('Job lido: id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) .. ' rawStatus=' .. tostring(rawStatus))
-                if tostring(job.status) == 'queued' then
+    processing = true
+    local okOuter, resultOrError = pcall(function()
+        LrFileUtils.createAllDirectories(jobsDir())
+        writeState('runner_alive.txt', timestamp() .. '\njobs=' .. jobsDir())
+        local processed, inspected = 0, 0
+
+        for path in LrFileUtils.files(jobsDir()) do
+            if isJobFile(path) then
+                inspected = inspected + 1
+                local job, readError = readJson(path)
+                if not job then
+                    plainLog('JSON inválido em ' .. path .. ': ' .. tostring(readError))
+                elseif tostring(job.status) == 'queued' then
                     local ok, result = pcall(processJob, path, job)
                     if not ok then
                         job.status, job.error = 'failed', tostring(result)
@@ -292,23 +272,25 @@ function Runner.processQueuedOnce()
                 end
             end
         end
-    end
 
-    writeState('last_scan.txt', timestamp() .. '\ninspected=' .. tostring(inspected) .. '\nprocessed=' .. tostring(processed))
-    hardTrace('processQueuedOnce EXIT inspected=' .. tostring(inspected) .. ' processed=' .. tostring(processed))
-    return processed
+        writeState('last_scan.txt', timestamp() .. '\ninspected=' .. tostring(inspected) .. '\nprocessed=' .. tostring(processed))
+        return processed
+    end)
+    processing = false
+
+    if not okOuter then error(resultOrError) end
+    return resultOrError
 end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V2.9 iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V3.0 iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
         local ok, err = pcall(Runner.processQueuedOnce)
         if not ok then plainLog('Erro ao verificar fila: ' .. tostring(err)) end
         LrTasks.sleep(2)
     end
-    plainLog('Plugin encerrado')
 end
 
 function Runner.getJobsDir() return jobsDir() end
