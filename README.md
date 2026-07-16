@@ -15,13 +15,16 @@ O Lightroom permanece aberto com o plugin instalado. O serviço Python recebe ta
 - Coleção por pasta e conjunto de coleções opcional.
 - Detecção de fotos já importadas.
 - Solicitação de Smart Previews pelo próprio Lightroom após a importação.
+- Compatibilidade direcionada ao Lightroom Classic 10.4.
+- Processamento automático e comando manual da fila.
+- Painel de estado no Gerenciador de plug-ins.
 - Logs do serviço, plugin e automação de Smart Previews.
 - ZIP sanitizado para depuração, sem incluir a chave da API.
 
 ## Requisitos
 
 - Windows 10/11.
-- Adobe Lightroom Classic.
+- Adobe Lightroom Classic 10.4 ou superior.
 - Python 3.11 ou superior.
 
 ## Instalação
@@ -59,12 +62,22 @@ No aplicativo existem os botões:
 - **Criar e abrir no Lightroom**
 - **Gerar ZIP de diagnóstico**
 
-## Instalar o plugin
+## Instalar ou atualizar o plugin no Lightroom 10.4
 
-1. Abra **Arquivo > Gerenciador de plug-ins** no Lightroom Classic.
-2. Clique em **Adicionar**.
-3. Selecione `lightroom_plugin\LRAutomatic.lrplugin`.
-4. Reinicie o Lightroom após atualizar arquivos do plugin.
+1. Feche o Lightroom Classic.
+2. Substitua a pasta antiga `LRAutomatic.lrplugin` pela versão atual do repositório.
+3. Abra o Lightroom.
+4. Vá em **Arquivo > Gerenciador de plug-ins**.
+5. Remova a versão antiga se ela apontar para outra pasta.
+6. Clique em **Adicionar** e selecione `lightroom_plugin\LRAutomatic.lrplugin`.
+7. Confirme que aparece **LRAutomatic 10.4** e que o painel informa `Loop automático: Ativo`.
+
+No módulo Biblioteca, abra **Biblioteca > Extras do plug-in**. Foram adicionadas estas opções:
+
+- **LRAutomatic - Testar plugin**: mostra o catálogo ativo e se o loop está rodando.
+- **LRAutomatic - Processar fila agora**: força imediatamente a leitura de todos os jobs `queued`.
+
+O loop automático verifica a fila a cada 2 segundos. O comando manual permite diagnosticar instalações em que o evento de inicialização não rodou corretamente.
 
 ## Importar múltiplas pastas
 
@@ -89,6 +102,8 @@ Consultar tarefas:
 lrautomatic jobs
 lrautomatic status JOB_ID
 ```
+
+Quando o plugin inicia um job, ele grava no JSON o caminho do catálogo ativo em `active_catalog_path` e muda o status de `queued` para `running`.
 
 ## Criar catálogo pelo CMD
 
@@ -119,6 +134,16 @@ A sequência de teclas pode ser sobrescrita pela variável:
 ```bat
 set LRAUTOMATIC_SMART_PREVIEW_KEYS=SEQUENCIA
 ```
+
+## Logs do plugin 10.4
+
+O executor grava um log simples em:
+
+```text
+%LOCALAPPDATA%\LRAutomatic\logs\plugin.log
+```
+
+Ele registra carregamento, pasta da fila, catálogo ativo, fotos encontradas, importações com falha e conclusão do job.
 
 ## ZIP de diagnóstico
 
