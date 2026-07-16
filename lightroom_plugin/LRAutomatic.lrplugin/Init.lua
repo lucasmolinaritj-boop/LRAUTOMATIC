@@ -1,13 +1,35 @@
 local LrApplication = import 'LrApplication'
+local LrPathUtils = import 'LrPathUtils'
 local LrTasks = import 'LrTasks'
 
 _G.LRAutomaticShutdown = false
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '0.2.1-instrumented'
+_G.LRAutomaticVersion = '0.2.2-lr104-pathfix'
 _G.LRAutomaticLastError = nil
+
+-- Lightroom 10.4 may expose os without getenv. Older modules previously used
+-- os.getenv('LOCALAPPDATA'), so provide a deterministic compatibility shim.
+if not os.getenv then
+    os.getenv = function(name)
+        if name == 'LOCALAPPDATA' then
+            local home = LrPathUtils.getStandardFilePath('home')
+            if home and home ~= '' then
+                return LrPathUtils.child(
+                    LrPathUtils.child(
+                        LrPathUtils.child(home, 'AppData'),
+                        'Local'
+                    ),
+                    ''
+                )
+            end
+        end
+        return nil
+    end
+end
 
 local okDebug, Debug = pcall(require, 'DebugLog')
 if not okDebug then
+    -- Lightroom itself will surface this loader error in Plugin Manager.
     return
 end
 
@@ -21,9 +43,9 @@ end
 
 Debug.info('bootstrap_enter', 'version=' .. _G.LRAutomaticVersion)
 Debug.info('plugin_path', tostring(_PLUGIN and _PLUGIN.path or '(indisponível)'))
-Debug.info('localappdata', tostring(os.getenv('LOCALAPPDATA')))
+Debug.info('data_dir', tostring(Debug.dataDir()))
 Debug.info('active_catalog', catalogPath())
-Debug.writeState('bootstrap.txt', 'OK\nversion=' .. _G.LRAutomaticVersion .. '\nplugin_path=' .. tostring(_PLUGIN and _PLUGIN.path or '') .. '\ncatalog=' .. catalogPath())
+Debug.writeState('bootstrap.txt', 'OK\nversion=' .. _G.LRAutomaticVersion .. '\nplugin_path=' .. tostring(_PLUGIN and _PLUGIN.path or '') .. '\ndata_dir=' .. tostring(Debug.dataDir()) .. '\ncatalog=' .. catalogPath())
 
 LrTasks.startAsyncTask(function()
     Debug.info('async_task_enter', 'carregando JobRunner')
