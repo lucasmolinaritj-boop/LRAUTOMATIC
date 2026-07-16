@@ -1,19 +1,19 @@
 return {
-    LrSdkVersion = 10.0,
+    LrSdkVersion = 6.0,
     LrSdkMinimumVersion = 6.0,
-    LrToolkitIdentifier = 'com.molinari.lrautomatic',
-    LrPluginName = 'LRAutomatic V2.3 Resgate',
+    LrToolkitIdentifier = 'com.molinari.lrautomatic.v24',
+    LrPluginName = 'LRAutomatic V2.4 Compatibilidade LR 10.4',
     LrInitPlugin = 'Init.lua',
     LrShutdownPlugin = 'Shutdown.lua',
     LrLibraryMenuItems = {
         {
-            title = 'LRAutomatic V2.3 - TESTE DE VIDA',
+            title = 'LRAutomatic V2.4 - Status e diagnóstico',
             file = 'RescueTest.lua',
         },
         {
-            title = 'LRAutomatic V2.3 - PROCESSAR FILA',
+            title = 'LRAutomatic V2.4 - Processar fila agora',
             file = 'ProcessNow.lua',
         },
     },
-    VERSION = { major = 0, minor = 2, revision = 3, build = 104 },
+    VERSION = { major = 0, minor = 2, revision = 4, build = 104 },
 }
