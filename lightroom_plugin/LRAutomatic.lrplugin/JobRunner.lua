@@ -25,7 +25,6 @@ end
 local function dataDir()
     return LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(homePath(), 'AppData'), 'Local'), 'LRAutomatic')
 end
-
 local function jobsDir() return LrPathUtils.child(dataDir(), 'jobs') end
 local function logsDir() return LrPathUtils.child(dataDir(), 'logs') end
 local function stateDir() return LrPathUtils.child(dataDir(), 'plugin_state') end
@@ -141,17 +140,10 @@ local function withWriteRetry(catalog, actionName, fn, detail)
             fn(context)
         end, {
             timeout = 10,
-            callback = function()
-                timedOut = true
-            end,
+            callback = function() timedOut = true end,
         })
-        plainLog('WRITE_END action=' .. actionName .. ' attempt=' .. attempt ..
-            ' status=' .. tostring(status) .. ' ran=' .. tostring(ran) ..
-            ' timeout=' .. tostring(timedOut))
-
-        if ran and (status == nil or status == 'executed') then
-            return true, 'executed'
-        end
+        plainLog('WRITE_END action=' .. actionName .. ' attempt=' .. attempt .. ' status=' .. tostring(status) .. ' ran=' .. tostring(ran) .. ' timeout=' .. tostring(timedOut))
+        if ran and (status == nil or status == 'executed') then return true, 'executed' end
         if attempt < 3 then LrTasks.sleep(attempt) end
     end
     return false, 'write_access_aborted'
@@ -168,7 +160,6 @@ local function ensureCollection(catalog, name)
     if not name or name == '' then return nil, nil end
     local existing = findCollection(catalog, name)
     if existing then return existing, nil end
-
     local ok, reason = withWriteRetry(catalog, 'LRAutomatic: criar coleção', function()
         catalog:createCollection(name, nil, true)
     end, name)
@@ -182,28 +173,97 @@ local function importOne(catalog, photoPath)
         plainLog('ADD_PHOTO_SKIPPED path=' .. tostring(photoPath))
         return before, 'skipped', nil
     end
-
     local importedPhoto = nil
     local ok, reason = withWriteRetry(catalog, 'LRAutomatic: importar foto', function()
         importedPhoto = catalog:addPhoto(photoPath)
     end, photoPath)
-
-    if not ok then
-        plainLog('ADD_PHOTO_WRITE_ABORTED path=' .. tostring(photoPath))
-        return nil, 'failed', reason
-    end
-
+    if not ok then return nil, 'failed', reason end
     local after = importedPhoto or catalog:findPhotoByPath(photoPath)
-    plainLog('ADD_PHOTO_RESULT path=' .. tostring(photoPath) ..
-        ' returned=' .. tostring(importedPhoto) .. ' found=' .. tostring(after))
+    plainLog('ADD_PHOTO_RESULT path=' .. tostring(photoPath) .. ' returned=' .. tostring(importedPhoto) .. ' found=' .. tostring(after))
     if after then return after, 'imported', nil end
     return nil, 'failed', 'addPhoto executou, mas a foto não apareceu no catálogo'
 end
 
-local function processSource(catalog, job, source, progress, jobPath)
+local function findPresetByNameOrUuid(name, uuid)
+    local function searchFolder(folder)
+        for _, preset in ipairs(folder:getDevelopPresets()) do
+            if (uuid and preset:getUuid() == uuid) or (name and preset:getName() == name) then return preset end
+        end
+        if folder.getChildren then
+            for _, child in ipairs(folder:getChildren()) do
+                local found = searchFolder(child)
+                if found then return found end
+            end
+        end
+        return nil
+    end
+    for _, folder in ipairs(LrApplication.developPresetFolders()) do
+        local found = searchFolder(folder)
+        if found then return found end
+    end
+    return nil
+end
+
+local function applyPreset(catalog, photos, job)
+    local request = job.request or {}
+    local name, uuid = request.develop_preset_name, request.develop_preset_uuid
+    if not name and not uuid then
+        job.preset_status = 'not_requested'
+        return true
+    end
+    job.preset_status = 'running'
+    local preset = findPresetByNameOrUuid(name, uuid)
+    if not preset then
+        job.preset_status = 'failed'
+        job.error = 'Preset não encontrado: ' .. tostring(name or uuid)
+        plainLog('PRESET_NOT_FOUND value=' .. tostring(name or uuid))
+        return false
+    end
+    local applied = 0
+    local ok, reason = withWriteRetry(catalog, 'LRAutomatic: aplicar preset', function()
+        for _, photo in ipairs(photos) do
+            photo:applyDevelopPreset(preset)
+            applied = applied + 1
+        end
+    end, preset:getName())
+    if not ok then
+        job.preset_status = 'failed'
+        job.error = 'Falha ao aplicar preset: ' .. tostring(reason)
+        return false
+    end
+    job.preset_status = 'completed'
+    job.preset_name_applied = preset:getName()
+    job.preset_applied_count = applied
+    plainLog('PRESET_APPLIED name=' .. tostring(preset:getName()) .. ' count=' .. tostring(applied))
+    return true
+end
+
+local function buildSmartPreviews(catalog, photos, job)
+    if not ((job.request or {}).build_smart_previews == true) then
+        job.smart_previews_status = 'not_requested'
+        return true
+    end
+    if #photos == 0 then
+        job.smart_previews_status = 'completed_no_photos'
+        return true
+    end
+    job.smart_previews_status = 'running'
+    plainLog('SMART_PREVIEWS_BEGIN count=' .. tostring(#photos))
+    local result = catalog:buildSmartPreviews(photos)
+    local created = result and result.created or {}
+    local existed = result and result.existed or {}
+    local failed = result and result.failed or {}
+    job.smart_previews_created = #created
+    job.smart_previews_existed = #existed
+    job.smart_previews_failed = #failed
+    job.smart_previews_status = (#failed > 0) and 'partial' or 'completed'
+    plainLog('SMART_PREVIEWS_END created=' .. #created .. ' existed=' .. #existed .. ' failed=' .. #failed)
+    return #failed == 0
+end
+
+local function processSource(catalog, job, source, progress, jobPath, postPhotos)
     progress.status = 'running'
     job.current_source = source.path
-
     local recursive = source.recursive
     if recursive == nil then recursive = job.request.recursive == true end
     local files = collectFiles(source.path, recursive)
@@ -218,6 +278,7 @@ local function processSource(catalog, job, source, progress, jobPath)
         if result == 'imported' then
             progress.imported = progress.imported + 1
             table.insert(photosForCollection, photo)
+            table.insert(postPhotos, photo)
         elseif result == 'skipped' then
             progress.skipped = progress.skipped + 1
             table.insert(photosForCollection, photo)
@@ -237,13 +298,9 @@ local function processSource(catalog, job, source, progress, jobPath)
             local ok, reason = withWriteRetry(catalog, 'LRAutomatic: adicionar à coleção', function()
                 collection:addPhotos(photosForCollection)
             end, collectionName)
-            if not ok then
-                progress.error = 'Fotos importadas, mas coleção falhou: ' .. tostring(reason)
-                plainLog(progress.error)
-            end
+            if not ok then progress.error = 'Fotos importadas, mas coleção falhou: ' .. tostring(reason) end
         else
             progress.error = 'Fotos importadas, mas coleção não foi criada: ' .. tostring(collectionErr)
-            plainLog(progress.error)
         end
     end
 
@@ -261,41 +318,44 @@ local function processJob(jobPath, job)
     if tostring(job.status) ~= 'queued' then return false end
     local catalog = LrApplication.activeCatalog()
     if not catalog then error('nenhum catálogo ativo no Lightroom') end
-
     job.active_catalog_path = catalog:getPath()
     job.status, job.error = 'running', nil
     writeJson(jobPath, job)
     plainLog('JOB_BEGIN id=' .. tostring(job.job_id) .. ' catalog=' .. tostring(job.active_catalog_path))
 
     local anyFailed = false
+    local importedPhotos = {}
     for index, source in ipairs((job.request and job.request.sources) or {}) do
         local progress = job.progress and job.progress[index]
         if progress then
-            processSource(catalog, job, source, progress, jobPath)
+            processSource(catalog, job, source, progress, jobPath, importedPhotos)
             if progress.status == 'failed' then anyFailed = true end
         end
     end
 
+    local presetOk = applyPreset(catalog, importedPhotos, job)
+    writeJson(jobPath, job)
+    local previewsOk = buildSmartPreviews(catalog, importedPhotos, job)
+    writeJson(jobPath, job)
+
     refreshTotals(job)
     job.current_source = nil
-    if anyFailed and job.total_imported > 0 then job.status = 'partial'
-    elseif anyFailed then job.status = 'failed'
-    else job.status = 'completed' end
+    if anyFailed or not presetOk or not previewsOk then
+        job.status = job.total_imported > 0 and 'partial' or 'failed'
+    else
+        job.status = 'completed'
+    end
     writeJson(jobPath, job)
-    plainLog('JOB_END id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) ..
-        ' imported=' .. tostring(job.total_imported) .. ' skipped=' .. tostring(job.total_skipped) ..
-        ' failed=' .. tostring(job.total_failed))
+    plainLog('JOB_END id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) .. ' imported=' .. tostring(job.total_imported) .. ' preset=' .. tostring(job.preset_status) .. ' smart=' .. tostring(job.smart_previews_status))
     return true
 end
 
 function Runner.processQueuedOnce()
     if processing then return 0 end
     processing = true
-
     LrFileUtils.createAllDirectories(jobsDir())
     writeState('runner_alive.txt', timestamp() .. '\njobs=' .. jobsDir())
     local processed, inspected = 0, 0
-
     for path in LrFileUtils.files(jobsDir()) do
         if isJobFile(path) then
             inspected = inspected + 1
@@ -308,7 +368,6 @@ function Runner.processQueuedOnce()
             end
         end
     end
-
     writeState('last_scan.txt', timestamp() .. '\ninspected=' .. inspected .. '\nprocessed=' .. processed)
     processing = false
     return processed
@@ -316,13 +375,13 @@ end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V3.4 Single Loop iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V4.0 Pipeline iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
         Runner.processQueuedOnce()
         LrTasks.sleep(2)
     end
-    plainLog('Plugin V3.4 loop encerrado')
+    plainLog('Plugin V4.0 loop encerrado')
 end
 
 function Runner.getJobsDir() return jobsDir() end
