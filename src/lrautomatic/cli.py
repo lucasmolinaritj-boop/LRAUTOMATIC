@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import httpx
@@ -9,7 +8,9 @@ import typer
 import uvicorn
 
 from .api import create_app
+from .catalogs import create_catalog
 from .config import load_settings
+from .diagnostics import create_diagnostic_zip
 from .models import ImportJobRequest, ImportSource
 
 app = typer.Typer(no_args_is_help=True, help="Automação local do Lightroom Classic")
@@ -27,13 +28,19 @@ def serve(config: str = typer.Option("config.json", help="Arquivo de configuraç
     uvicorn.run(create_app(config), host=settings.host, port=settings.port)
 
 
+@app.command("desktop")
+def desktop() -> None:
+    from .desktop import main
+    main()
+
+
 @app.command("import")
 def import_photos(
     source: list[str] = typer.Option(None, "--source", "-s", help="Pasta ou Pasta|Nome da coleção"),
     job: Path | None = typer.Option(None, "--job", exists=True, dir_okay=False),
     collection_set: str | None = typer.Option(None),
     recursive: bool = typer.Option(False),
-    smart_previews: bool = typer.Option(False, help="Registra solicitação; SDK público não executa ainda"),
+    smart_previews: bool = typer.Option(False, help="Seleciona as importadas e pede ao próprio Lightroom para criar Smart Previews"),
     config: str = typer.Option("config.json"),
 ) -> None:
     if job:
@@ -90,22 +97,20 @@ def cancel(job_id: str, config: str = typer.Option("config.json")) -> None:
 @app.command("catalog-create")
 def catalog_create(
     name: str = typer.Option(..., help="Nome do novo catálogo"),
+    open_lightroom: bool = typer.Option(True, "--open-lightroom/--no-open-lightroom"),
     config: str = typer.Option("config.json"),
 ) -> None:
-    settings = load_settings(config)
-    if not settings.catalog_template or not settings.catalog_template.exists():
-        raise typer.BadParameter("catalog_template ainda não foi configurado ou não existe")
-    if not settings.catalog_output_root:
-        raise typer.BadParameter("catalog_output_root ainda não foi configurado")
-    safe_name = "".join(char for char in name if char not in '<>:"/\\|?*').strip()
-    if not safe_name:
-        raise typer.BadParameter("Nome de catálogo inválido")
-    destination = settings.catalog_output_root / f"{safe_name}.lrcat"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        raise typer.BadParameter(f"Já existe: {destination}")
-    shutil.copy2(settings.catalog_template, destination)
-    typer.echo(str(destination))
+    result = create_catalog(load_settings(config), name, open_lightroom=open_lightroom)
+    typer.echo(json.dumps({"catalog_path": str(result.catalog_path), "launched": result.launched}, ensure_ascii=False, indent=2))
+
+
+@app.command("diagnostic-zip")
+def diagnostic_zip(
+    output: Path = typer.Option(Path.cwd(), help="Pasta de destino"),
+    config: str = typer.Option("config.json"),
+) -> None:
+    path = create_diagnostic_zip(load_settings(config), config, output)
+    typer.echo(str(path))
 
 
 if __name__ == "__main__":
