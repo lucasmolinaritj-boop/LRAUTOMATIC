@@ -13,6 +13,9 @@
   "homepicz_photos_root": "M:\\Meu Drive\\Homepicz\\Fotos do dia",
   "homepicz_interval_minutes": 30,
   "homepicz_preset_name": null,
+  "homepicz_standard_previews": true,
+  "homepicz_standard_preview_size": 2048,
   "homepicz_smart_previews": true,
-  "homepicz_recursive": false
+  "homepicz_recursive": false,
+  "homepicz_allowed_extensions": "cr2,cr3,dng"
 }
