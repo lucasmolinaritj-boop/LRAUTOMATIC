@@ -31,7 +31,7 @@ class ImportWindow:
 
 def previous_business_window(today: date | None = None) -> ImportWindow:
     today = today or date.today()
-    if today.weekday() == 0:  # segunda-feira: sexta, sábado e domingo
+    if today.weekday() == 0:
         return ImportWindow(today - timedelta(days=3), today - timedelta(days=1))
     yesterday = today - timedelta(days=1)
     return ImportWindow(yesterday, yesterday)
@@ -67,8 +67,7 @@ def _write_state(settings: Settings, payload: dict[str, object]) -> None:
     payload = dict(payload)
     payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
     settings.scheduler_state_file.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 
@@ -93,13 +92,20 @@ def run_cycle(settings: Settings, store: JobStore) -> dict[str, object]:
         "ids": len(ids),
         "valid_sources": len(sources),
         "missing_ids": missing,
+        "allowed_extensions": settings.allowed_extensions,
+        "standard_previews": settings.homepicz_standard_previews,
+        "standard_preview_size": settings.homepicz_standard_preview_size,
+        "smart_previews": settings.homepicz_smart_previews,
     }
     if sources:
         request = ImportJobRequest(
             sources=sources,
             collection_set=f"Home Picz - {window.label}",
             recursive=settings.homepicz_recursive,
+            build_standard_previews=settings.homepicz_standard_previews,
+            standard_preview_size=settings.homepicz_standard_preview_size,
             build_smart_previews=settings.homepicz_smart_previews,
+            allowed_extensions=settings.allowed_extensions,
             develop_preset_name=settings.homepicz_preset_name,
             duplicate_policy="skip",
         )
