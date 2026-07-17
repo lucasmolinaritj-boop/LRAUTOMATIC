@@ -10,11 +10,7 @@ local logger = LrLogger('LRAutomatic')
 logger:enable('logfile')
 
 local processing = false
-local SUPPORTED = {
-    arw=true, cr2=true, cr3=true, dng=true, heic=true, heif=true,
-    jpeg=true, jpg=true, nef=true, orf=true, raf=true, rw2=true,
-    tif=true, tiff=true,
-}
+local DEFAULT_EXTENSIONS = { cr2=true, cr3=true, dng=true }
 
 local function homePath()
     local home = LrPathUtils.getStandardFilePath('home')
@@ -104,17 +100,37 @@ local function normalizedExtension(path)
     return ext
 end
 
+local function allowedExtensionTable(request)
+    local configured = request and request.allowed_extensions
+    if type(configured) ~= 'table' or #configured == 0 then return DEFAULT_EXTENSIONS end
+    local result = {}
+    for _, value in ipairs(configured) do
+        local ext = string.lower(tostring(value or ''))
+        if string.sub(ext, 1, 1) == '.' then ext = string.sub(ext, 2) end
+        if ext ~= '' then result[ext] = true end
+    end
+    if next(result) == nil then return DEFAULT_EXTENSIONS end
+    return result
+end
+
+local function extensionsLabel(allowed)
+    local values = {}
+    for ext, enabled in pairs(allowed) do if enabled then table.insert(values, ext) end end
+    table.sort(values)
+    return table.concat(values, ',')
+end
+
 local function isJobFile(path)
     local name = string.lower(LrPathUtils.leafName(path) or tostring(path))
     return string.sub(name, 1, 4) == 'job_' and string.sub(name, -5) == '.json'
 end
 
-local function collectFiles(folder, recursive)
+local function collectFiles(folder, recursive, allowed)
     if not LrFileUtils.exists(folder) then error('pasta de origem não existe: ' .. tostring(folder)) end
     local result = {}
     local iterator = recursive and LrFileUtils.recursiveFiles(folder) or LrFileUtils.files(folder)
     for path in iterator do
-        if SUPPORTED[normalizedExtension(path)] then table.insert(result, path) end
+        if allowed[normalizedExtension(path)] then table.insert(result, path) end
     end
     table.sort(result)
     return result
@@ -132,16 +148,12 @@ end
 
 local function withWriteRetry(catalog, actionName, fn, detail)
     for attempt = 1, 3 do
-        local ran = false
-        local timedOut = false
+        local ran, timedOut = false, false
         plainLog('WRITE_BEGIN action=' .. actionName .. ' attempt=' .. attempt .. ' detail=' .. tostring(detail))
         local status = catalog:withWriteAccessDo(actionName, function(context)
             ran = true
             fn(context)
-        end, {
-            timeout = 10,
-            callback = function() timedOut = true end,
-        })
+        end, { timeout=10, callback=function() timedOut=true end })
         plainLog('WRITE_END action=' .. actionName .. ' attempt=' .. attempt .. ' status=' .. tostring(status) .. ' ran=' .. tostring(ran) .. ' timeout=' .. tostring(timedOut))
         if ran and (status == nil or status == 'executed') then return true, 'executed' end
         if attempt < 3 then LrTasks.sleep(attempt) end
@@ -207,24 +219,17 @@ end
 local function applyPreset(catalog, photos, job)
     local request = job.request or {}
     local name, uuid = request.develop_preset_name, request.develop_preset_uuid
-    if not name and not uuid then
-        job.preset_status = 'not_requested'
-        return true
-    end
+    if not name and not uuid then job.preset_status = 'not_requested'; return true end
     job.preset_status = 'running'
     local preset = findPresetByNameOrUuid(name, uuid)
     if not preset then
         job.preset_status = 'failed'
         job.error = 'Preset não encontrado: ' .. tostring(name or uuid)
-        plainLog('PRESET_NOT_FOUND value=' .. tostring(name or uuid))
         return false
     end
     local applied = 0
     local ok, reason = withWriteRetry(catalog, 'LRAutomatic: aplicar preset', function()
-        for _, photo in ipairs(photos) do
-            photo:applyDevelopPreset(preset)
-            applied = applied + 1
-        end
+        for _, photo in ipairs(photos) do photo:applyDevelopPreset(preset); applied = applied + 1 end
     end, preset:getName())
     if not ok then
         job.preset_status = 'failed'
@@ -238,15 +243,50 @@ local function applyPreset(catalog, photos, job)
     return true
 end
 
+local function buildStandardPreviews(photos, job)
+    local request = job.request or {}
+    if request.build_standard_previews ~= true then
+        job.standard_previews_status = 'not_requested'
+        return true
+    end
+    if #photos == 0 then
+        job.standard_previews_status = 'completed_no_photos'
+        return true
+    end
+    local size = tonumber(request.standard_preview_size) or 2048
+    if size < 256 then size = 256 end
+    if size > 16384 then size = 16384 end
+    job.standard_previews_status = 'running'
+    job.standard_previews_created = 0
+    job.standard_previews_failed = 0
+    plainLog('STANDARD_PREVIEWS_BEGIN count=' .. tostring(#photos) .. ' size=' .. tostring(size))
+    for _, photo in ipairs(photos) do
+        local done, success = false, false
+        local requestObject = photo:requestJpegThumbnail(size, size, function(data, errorMessage)
+            success = data ~= nil
+            if not success then plainLog('STANDARD_PREVIEW_FAILED error=' .. tostring(errorMessage)) end
+            done = true
+        end)
+        local deadline = os.time() + 120
+        while not done and os.time() < deadline do LrTasks.sleep(0.1) end
+        requestObject = nil
+        if done and success then
+            job.standard_previews_created = job.standard_previews_created + 1
+        else
+            job.standard_previews_failed = job.standard_previews_failed + 1
+        end
+    end
+    job.standard_previews_status = job.standard_previews_failed > 0 and 'partial' or 'completed'
+    plainLog('STANDARD_PREVIEWS_END created=' .. tostring(job.standard_previews_created) .. ' failed=' .. tostring(job.standard_previews_failed))
+    return job.standard_previews_failed == 0
+end
+
 local function buildSmartPreviews(catalog, photos, job)
     if not ((job.request or {}).build_smart_previews == true) then
         job.smart_previews_status = 'not_requested'
         return true
     end
-    if #photos == 0 then
-        job.smart_previews_status = 'completed_no_photos'
-        return true
-    end
+    if #photos == 0 then job.smart_previews_status = 'completed_no_photos'; return true end
     job.smart_previews_status = 'running'
     plainLog('SMART_PREVIEWS_BEGIN count=' .. tostring(#photos))
     local result = catalog:buildSmartPreviews(photos)
@@ -261,16 +301,16 @@ local function buildSmartPreviews(catalog, photos, job)
     return #failed == 0
 end
 
-local function processSource(catalog, job, source, progress, jobPath, postPhotos)
+local function processSource(catalog, job, source, progress, jobPath, postPhotos, allowed)
     progress.status = 'running'
     job.current_source = source.path
     local recursive = source.recursive
     if recursive == nil then recursive = job.request.recursive == true end
-    local files = collectFiles(source.path, recursive)
+    local files = collectFiles(source.path, recursive, allowed)
     progress.discovered = #files
     refreshTotals(job)
     writeJson(jobPath, job)
-    plainLog('SOURCE_DISCOVERED path=' .. tostring(source.path) .. ' count=' .. tostring(#files))
+    plainLog('SOURCE_DISCOVERED path=' .. tostring(source.path) .. ' count=' .. tostring(#files) .. ' extensions=' .. extensionsLabel(allowed))
 
     local photosForCollection = {}
     for _, photoPath in ipairs(files) do
@@ -321,32 +361,36 @@ local function processJob(jobPath, job)
     job.active_catalog_path = catalog:getPath()
     job.status, job.error = 'running', nil
     writeJson(jobPath, job)
-    plainLog('JOB_BEGIN id=' .. tostring(job.job_id) .. ' catalog=' .. tostring(job.active_catalog_path))
+
+    local allowed = allowedExtensionTable(job.request or {})
+    plainLog('JOB_BEGIN id=' .. tostring(job.job_id) .. ' catalog=' .. tostring(job.active_catalog_path) .. ' extensions=' .. extensionsLabel(allowed))
 
     local anyFailed = false
     local importedPhotos = {}
     for index, source in ipairs((job.request and job.request.sources) or {}) do
         local progress = job.progress and job.progress[index]
         if progress then
-            processSource(catalog, job, source, progress, jobPath, importedPhotos)
+            processSource(catalog, job, source, progress, jobPath, importedPhotos, allowed)
             if progress.status == 'failed' then anyFailed = true end
         end
     end
 
     local presetOk = applyPreset(catalog, importedPhotos, job)
     writeJson(jobPath, job)
-    local previewsOk = buildSmartPreviews(catalog, importedPhotos, job)
+    local standardOk = buildStandardPreviews(importedPhotos, job)
+    writeJson(jobPath, job)
+    local smartOk = buildSmartPreviews(catalog, importedPhotos, job)
     writeJson(jobPath, job)
 
     refreshTotals(job)
     job.current_source = nil
-    if anyFailed or not presetOk or not previewsOk then
+    if anyFailed or not presetOk or not standardOk or not smartOk then
         job.status = job.total_imported > 0 and 'partial' or 'failed'
     else
         job.status = 'completed'
     end
     writeJson(jobPath, job)
-    plainLog('JOB_END id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) .. ' imported=' .. tostring(job.total_imported) .. ' preset=' .. tostring(job.preset_status) .. ' smart=' .. tostring(job.smart_previews_status))
+    plainLog('JOB_END id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) .. ' imported=' .. tostring(job.total_imported) .. ' standard=' .. tostring(job.standard_previews_status) .. ' smart=' .. tostring(job.smart_previews_status))
     return true
 end
 
@@ -363,7 +407,13 @@ function Runner.processQueuedOnce()
             if not job then
                 plainLog('JSON_INVALID path=' .. path .. ' error=' .. tostring(readError))
             elseif tostring(job.status) == 'queued' then
-                processJob(path, job)
+                local ok, err = pcall(processJob, path, job)
+                if not ok then
+                    job.status = 'failed'
+                    job.error = tostring(err)
+                    pcall(writeJson, path, job)
+                    plainLog('JOB_CRASH id=' .. tostring(job.job_id) .. ' error=' .. tostring(err))
+                end
                 processed = processed + 1
             end
         end
@@ -375,13 +425,13 @@ end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V4.0 Pipeline iniciado; monitorando ' .. jobsDir())
+    plainLog('Plugin V4.1 Pipeline iniciado; monitorando ' .. jobsDir())
     while not shouldStop() do
         writeState('heartbeat.txt', timestamp() .. '\nloop=running\njobs=' .. jobsDir())
         Runner.processQueuedOnce()
         LrTasks.sleep(2)
     end
-    plainLog('Plugin V4.0 loop encerrado')
+    plainLog('Plugin V4.1 loop encerrado')
 end
 
 function Runner.getJobsDir() return jobsDir() end
