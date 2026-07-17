@@ -7,6 +7,7 @@ O Lightroom permanece aberto com o plugin instalado. O serviço Python recebe ta
 ## Recursos atuais
 
 - Aplicativo desktop com criação de catálogo e ZIP de diagnóstico.
+- Editor completo de configurações dentro do aplicativo.
 - Criação de catálogo pelo app a partir de um catálogo-modelo oficial vazio.
 - Abertura automática do novo catálogo no Lightroom.
 - Importação de múltiplas pastas em um comando.
@@ -35,7 +36,27 @@ Execute:
 instalar.bat
 ```
 
-Depois configure `config.json`:
+O `config.json` continua sendo usado pela CLI, API, serviço e agente, mas não precisa mais ser editado manualmente. Abra o aplicativo e use a aba **Configurações**.
+
+A tela permite editar:
+
+- host, porta, chave da API e pasta de dados;
+- catálogo-modelo, destino dos catálogos e executável do Lightroom;
+- modelo de nome, formato e origem da data do catálogo;
+- URL do Apps Script, pasta de fotos, intervalo, preset, Smart Previews e recursividade da automação Home Picz.
+
+Também existem ações para:
+
+- gerar chave de API forte;
+- selecionar arquivos e pastas pelo Windows;
+- validar variáveis e caminhos;
+- recarregar o `config.json`;
+- restaurar valores padrão;
+- salvar o arquivo de forma atômica, reduzindo risco de corrupção.
+
+Alterações em host, porta, chave, pasta de dados ou processos automáticos já em execução podem exigir reinício do serviço ou agente.
+
+Exemplo do arquivo persistido:
 
 ```json
 {
@@ -57,10 +78,13 @@ O catálogo-modelo pode ser colocado depois. Ele deve ser um catálogo vazio cri
 abrir_app.bat
 ```
 
-No aplicativo existem os botões:
+Abas disponíveis:
 
-- **Criar e abrir no Lightroom**
-- **Gerar ZIP de diagnóstico**
+- **Pipeline de fotos**
+- **Novo catálogo**
+- **Fila e estado**
+- **Configurações**
+- **Diagnóstico**
 
 ## Instalar ou atualizar o plugin no Lightroom 10.4
 
