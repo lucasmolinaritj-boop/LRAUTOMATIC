@@ -29,12 +29,24 @@ class ImportWindow:
         return f"{self.start:%d-%m-%Y}_a_{self.end:%d-%m-%Y}"
 
 
+def operational_today(settings: Settings, now: datetime | None = None) -> date:
+    current = now or datetime.now()
+    result = current.date()
+    if current.time().replace(second=0, microsecond=0) >= settings.day_rollover_time:
+        result += timedelta(days=1)
+    return result
+
+
 def previous_business_window(today: date | None = None) -> ImportWindow:
     today = today or date.today()
     if today.weekday() == 0:
         return ImportWindow(today - timedelta(days=3), today - timedelta(days=1))
     yesterday = today - timedelta(days=1)
     return ImportWindow(yesterday, yesterday)
+
+
+def current_import_window(settings: Settings, now: datetime | None = None) -> ImportWindow:
+    return previous_business_window(operational_today(settings, now))
 
 
 def _fetch_ids(settings: Settings, window: ImportWindow) -> list[str]:
@@ -71,8 +83,10 @@ def _write_state(settings: Settings, payload: dict[str, object]) -> None:
     )
 
 
-def run_cycle(settings: Settings, store: JobStore) -> dict[str, object]:
-    window = previous_business_window()
+def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) -> dict[str, object]:
+    current = now or datetime.now()
+    effective_today = operational_today(settings, current)
+    window = previous_business_window(effective_today)
     catalog_path = _catalog_for_window(settings, window)
     ids = _fetch_ids(settings, window)
     sources: list[ImportSource] = []
@@ -86,7 +100,11 @@ def run_cycle(settings: Settings, store: JobStore) -> dict[str, object]:
 
     result: dict[str, object] = {
         "status": "completed",
-        "at": datetime.now().isoformat(timespec="seconds"),
+        "at": current.isoformat(timespec="seconds"),
+        "calendar_date": current.date().isoformat(),
+        "operational_today": effective_today.isoformat(),
+        "day_rollover_time": settings.homepicz_day_rollover_time,
+        "rollover_applied": effective_today != current.date(),
         "window": {"start": window.start.isoformat(), "end": window.end.isoformat()},
         "catalog_path": str(catalog_path),
         "ids": len(ids),
@@ -130,7 +148,10 @@ class HomePiczScheduler:
         self.first_cycle_done.clear()
         self.thread = threading.Thread(target=self._loop, name="HomePiczScheduler", daemon=True)
         self.thread.start()
-        log.info("Scheduler Home Picz iniciado; primeira verificação será imediata")
+        log.info(
+            "Scheduler Home Picz iniciado; primeira verificação imediata; virada operacional às %s",
+            self.settings.homepicz_day_rollover_time,
+        )
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -152,6 +173,7 @@ class HomePiczScheduler:
                     {
                         "status": "failed",
                         "at": started_at,
+                        "day_rollover_time": self.settings.homepicz_day_rollover_time,
                         "error": f"{type(exc).__name__}: {exc}",
                     },
                 )
