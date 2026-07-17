@@ -4,7 +4,7 @@ import json
 import os
 import secrets
 import tempfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -62,10 +62,10 @@ class Settings:
             errors.append("Host da API não pode ficar vazio.")
         if not 1 <= self.port <= 65535:
             errors.append("Porta da API deve estar entre 1 e 65535.")
-        if not self.api_key.strip() or self.api_key == "change-me":
-            errors.append("Defina uma chave de API forte.")
-        elif len(self.api_key) < 24:
-            errors.append("A chave de API deve ter pelo menos 24 caracteres.")
+        if not self.api_key.strip():
+            errors.append("A chave da API não pode ficar vazia.")
+        elif self.api_key != "change-me" and len(self.api_key) < 24:
+            errors.append("A chave da API deve ter pelo menos 24 caracteres.")
         if "{date}" not in self.catalog_naming_template:
             errors.append("O modelo de nome do catálogo deve conter {date}.")
         if self.catalog_date_source not in {"earliest_file", "today"}:
@@ -74,6 +74,8 @@ class Settings:
             errors.append("O intervalo Home Picz deve ser de pelo menos 1 minuto.")
 
         if check_paths:
+            if self.api_key == "change-me":
+                errors.append("A chave da API ainda está no valor provisório; gere uma chave forte.")
             if self.catalog_template and not self.catalog_template.is_file():
                 errors.append("O catálogo-modelo não foi encontrado.")
             if self.catalog_output_root and not self.catalog_output_root.exists():
