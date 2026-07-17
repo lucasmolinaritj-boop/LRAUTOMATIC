@@ -5,7 +5,7 @@ _G.LRAutomaticShutdown = true
 _G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
 local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '3.4-single-loop-lr104'
+_G.LRAutomaticVersion = '4.2-yield-safe-preview-isolation-lr104'
 _G.LRAutomaticLastError = nil
 
 LrTasks.startAsyncTask(function()
