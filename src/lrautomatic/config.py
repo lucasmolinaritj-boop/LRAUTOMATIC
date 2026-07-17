@@ -5,10 +5,24 @@ import os
 import secrets
 import tempfile
 from dataclasses import dataclass, fields
+from datetime import time
 from pathlib import Path
 from typing import Any
 
 from .models import DEFAULT_PHOTO_EXTENSIONS, normalize_extensions
+
+
+def parse_rollover_time(value: str | time) -> time:
+    if isinstance(value, time):
+        return value.replace(second=0, microsecond=0)
+    raw = str(value or "").strip()
+    try:
+        parsed = time.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError("O horário de virada deve estar no formato HH:MM, por exemplo 18:00.") from exc
+    if parsed.second or parsed.microsecond:
+        raise ValueError("O horário de virada deve usar apenas hora e minuto, no formato HH:MM.")
+    return parsed
 
 
 @dataclass(slots=True)
@@ -26,6 +40,7 @@ class Settings:
     homepicz_appscript_url: str | None = None
     homepicz_photos_root: Path = Path(r"M:\Meu Drive\Homepicz\Fotos do dia")
     homepicz_interval_minutes: int = 30
+    homepicz_day_rollover_time: str = "18:00"
     homepicz_preset_name: str | None = None
     homepicz_standard_previews: bool = True
     homepicz_standard_preview_size: int = 2048
@@ -61,6 +76,10 @@ class Settings:
     def allowed_extensions(self) -> list[str]:
         return normalize_extensions(self.homepicz_allowed_extensions)
 
+    @property
+    def day_rollover_time(self) -> time:
+        return parse_rollover_time(self.homepicz_day_rollover_time)
+
     def ensure_dirs(self) -> None:
         for path in (self.data_dir, self.jobs_dir, self.responses_dir, self.control_dir, self.logs_dir):
             path.mkdir(parents=True, exist_ok=True)
@@ -81,6 +100,10 @@ class Settings:
             errors.append("A origem da data deve ser earliest_file ou today.")
         if self.homepicz_interval_minutes < 1:
             errors.append("O intervalo Home Picz deve ser de pelo menos 1 minuto.")
+        try:
+            parse_rollover_time(self.homepicz_day_rollover_time)
+        except ValueError as exc:
+            errors.append(str(exc))
         if not 256 <= self.homepicz_standard_preview_size <= 16384:
             errors.append("O tamanho da visualização padrão deve ficar entre 256 e 16384 pixels.")
         try:
@@ -122,8 +145,9 @@ SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     )),
     ("Automação Home Picz", (
         "homepicz_appscript_url", "homepicz_photos_root", "homepicz_interval_minutes",
-        "homepicz_preset_name", "homepicz_standard_previews", "homepicz_standard_preview_size",
-        "homepicz_smart_previews", "homepicz_recursive", "homepicz_allowed_extensions",
+        "homepicz_day_rollover_time", "homepicz_preset_name", "homepicz_standard_previews",
+        "homepicz_standard_preview_size", "homepicz_smart_previews", "homepicz_recursive",
+        "homepicz_allowed_extensions",
     )),
 )
 
@@ -141,6 +165,7 @@ SETTING_LABELS: dict[str, str] = {
     "homepicz_appscript_url": "URL do Google Apps Script",
     "homepicz_photos_root": "Pasta das fotos Home Picz",
     "homepicz_interval_minutes": "Intervalo de consulta (minutos)",
+    "homepicz_day_rollover_time": "Horário de virada do dia operacional (HH:MM)",
     "homepicz_preset_name": "Preset padrão Home Picz",
     "homepicz_standard_previews": "Criar visualizações padrão",
     "homepicz_standard_preview_size": "Tamanho da visualização padrão (px)",
@@ -190,6 +215,7 @@ def _parse_bool(value: Any, default: bool) -> bool:
 def settings_from_dict(raw: dict[str, Any]) -> Settings:
     date_source = str(raw.get("catalog_date_source", "earliest_file")).strip().lower()
     extensions = normalize_extensions(raw.get("homepicz_allowed_extensions", DEFAULT_PHOTO_EXTENSIONS))
+    rollover = parse_rollover_time(raw.get("homepicz_day_rollover_time", "18:00")).strftime("%H:%M")
     settings = Settings(
         host=str(raw.get("host", "127.0.0.1")).strip(),
         port=int(raw.get("port", 45821)),
@@ -204,12 +230,13 @@ def settings_from_dict(raw: dict[str, Any]) -> Settings:
         homepicz_appscript_url=(str(raw["homepicz_appscript_url"]).strip() if raw.get("homepicz_appscript_url") else None),
         homepicz_photos_root=_required_path(raw.get("homepicz_photos_root", r"M:\Meu Drive\Homepicz\Fotos do dia")),
         homepicz_interval_minutes=int(raw.get("homepicz_interval_minutes", 30)),
+        homepicz_day_rollover_time=rollover,
         homepicz_preset_name=(str(raw["homepicz_preset_name"]).strip() if raw.get("homepicz_preset_name") else None),
         homepicz_standard_previews=_parse_bool(raw.get("homepicz_standard_previews"), True),
         homepicz_standard_preview_size=int(raw.get("homepicz_standard_preview_size", 2048)),
         homepicz_smart_previews=_parse_bool(raw.get("homepicz_smart_previews"), True),
         homepicz_recursive=_parse_bool(raw.get("homepicz_recursive"), False),
-        homepicz_allowed_extensions=','.join(extensions),
+        homepicz_allowed_extensions=",".join(extensions),
     )
     errors = settings.validate(check_paths=False)
     if errors:
