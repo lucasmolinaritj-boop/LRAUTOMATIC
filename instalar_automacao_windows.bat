@@ -8,20 +8,19 @@ echo  LRAutomatic - Automacao completa Home Picz
 echo ================================================
 echo.
 
-rem A automacao completa exige privilegios administrativos para o servico
-rem e para a tarefa agendada com nivel elevado.
+rem A automacao completa exige privilegios administrativos.
 fltmc >nul 2>&1
 if errorlevel 1 (
   echo [INFO] Solicitando permissao de administrador...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "Start-Process -FilePath $env:ComSpec -ArgumentList '/d','/c','""%~f0""' -Verb RunAs"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
   exit /b
 )
 
 if not exist "instalar_servidor.bat" goto :erro_estrutura
+if not exist "executar_agente_homepicz.bat" goto :erro_lancador
 
 rem O instalador do servidor ja instala/atualiza pacote, dependencias e API.
-echo [1/5] Instalando ou atualizando aplicativo e servidor...
+echo [1/6] Instalando ou atualizando aplicativo e servidor...
 set "LRAUTOMATIC_NO_PAUSE=1"
 call "instalar_servidor.bat"
 set "SERVER_RESULT=!ERRORLEVEL!"
@@ -29,33 +28,35 @@ set "LRAUTOMATIC_NO_PAUSE="
 if not "!SERVER_RESULT!"=="0" goto :erro_servidor
 
 set "PYTHON_EXE=%CD%\.venv\Scripts\python.exe"
-set "PYTHONW_EXE=%CD%\.venv\Scripts\pythonw.exe"
 if not exist "%PYTHON_EXE%" goto :erro_python
-if not exist "%PYTHONW_EXE%" set "PYTHONW_EXE=%PYTHON_EXE%"
 if not exist "%CD%\config.json" goto :erro_config
 
-echo [2/5] Validando agente Home Picz...
+echo [2/6] Validando agente Home Picz...
 "%PYTHON_EXE%" -c "import lrautomatic.session_agent; print('[OK] Agente de sessao carregado.')"
 if errorlevel 1 goto :erro_agente
 
 rem Encerra qualquer copia anterior para impedir agentes duplicados.
-echo [3/5] Encerrando agente antigo, se existir...
+echo [3/6] Encerrando agente antigo, se existir...
 schtasks /End /TN "LRAutomatic Session Agent" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*lrautomatic.session_agent*' -and $_.ProcessId -ne $PID } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 
-rem O PowerShell registra a tarefa sem os problemas de aspas do schtasks /TR.
-echo [4/5] Registrando automacao no logon do Windows...
+rem Remove tarefa antiga antes de recriar.
+echo [4/6] Removendo tarefa antiga, se existir...
+schtasks /Delete /TN "LRAutomatic Session Agent" /F >nul 2>&1
+
+rem Registra tarefa apontando para um BAT simples, sem linha complexa de argumentos.
+echo [5/6] Registrando automacao no logon do Windows...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference='Stop'; $name='LRAutomatic Session Agent'; $exe='%PYTHONW_EXE%'; $cfg='%CD%\config.json'; $wd='%CD%'; Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue; $action=New-ScheduledTaskAction -Execute $exe -Argument ('-m lrautomatic.session_agent "' + $cfg + '"') -WorkingDirectory $wd; $trigger=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; $settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero); $principal=New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Highest; Register-ScheduledTask -TaskName $name -Description 'Agente Home Picz do LRAutomatic' -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null"
+  "$ErrorActionPreference='Stop'; $name='LRAutomatic Session Agent'; $launcher='%CD%\executar_agente_homepicz.bat'; $action=New-ScheduledTaskAction -Execute $launcher -WorkingDirectory '%CD%'; $trigger=New-ScheduledTaskTrigger -AtLogOn; $settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero); $principal=New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Highest; Register-ScheduledTask -TaskName $name -Description 'Agente Home Picz do LRAutomatic' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null"
 if errorlevel 1 goto :erro_tarefa
 
-echo [5/5] Iniciando automacao agora...
+echo [6/6] Iniciando automacao agora...
 schtasks /Run /TN "LRAutomatic Session Agent" >nul
 if errorlevel 1 goto :erro_inicio
 
-timeout /t 2 /nobreak >nul
-schtasks /Query /TN "LRAutomatic Session Agent" /FO LIST | findstr /I /C:"Status:" /C:"Estado:"
+timeout /t 3 /nobreak >nul
+schtasks /Query /TN "LRAutomatic Session Agent" /FO LIST | findstr /I /C:"Status:" /C:"Estado:" /C:"Last Run Result:" /C:"Resultado da Ultima Execucao:"
 
 echo.
 echo ================================================
@@ -70,11 +71,14 @@ echo  Uso normal: abrir_app.bat
 echo  Reparar apenas API: instalar_servidor.bat
 echo  Remover tudo: desinstalar_automacao_windows.bat
 echo ================================================
-if not defined LRAUTOMATIC_NO_PAUSE pause
+pause
 exit /b 0
 
 :erro_estrutura
 echo [ERRO] instalar_servidor.bat nao foi encontrado nesta pasta.
+goto :fim_erro
+:erro_lancador
+echo [ERRO] executar_agente_homepicz.bat nao foi encontrado nesta pasta.
 goto :fim_erro
 :erro_servidor
 echo [ERRO] A instalacao do aplicativo ou servidor falhou.
@@ -90,12 +94,26 @@ echo [ERRO] O modulo do agente Home Picz nao pode ser carregado.
 goto :fim_erro
 :erro_tarefa
 echo [ERRO] Nao foi possivel criar a tarefa agendada do agente.
-goto :fim_erro
+goto :mostrar_diagnostico
 :erro_inicio
 echo [ERRO] A tarefa foi criada, mas nao iniciou.
+goto :mostrar_diagnostico
+
+:mostrar_diagnostico
+echo.
+echo Estado da tarefa:
+schtasks /Query /TN "LRAutomatic Session Agent" /V /FO LIST
+echo.
+echo Eventos recentes do Agendador de Tarefas:
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -MaxEvents 20 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'LRAutomatic Session Agent' } | Select-Object -First 8 TimeCreated,Id,LevelDisplayName,Message | Format-List"
+echo.
+echo Log auxiliar, se existir: %%TEMP%%\lrautomatic-agent-launcher.log
+
 goto :fim_erro
+
 :fim_erro
 echo.
 echo A instalacao da automacao nao foi concluida.
-if not defined LRAUTOMATIC_NO_PAUSE pause
+pause
 exit /b 1
