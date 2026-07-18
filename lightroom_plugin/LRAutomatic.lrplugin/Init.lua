@@ -5,7 +5,7 @@ _G.LRAutomaticShutdown = true
 _G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
 local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '4.9-skip-means-skip-preset-selective-preview-retry-lr104'
+_G.LRAutomaticVersion = '4.9.1-resilient-job-json-lr104'
 _G.LRAutomaticLastError = nil
 
 LrTasks.startAsyncTask(function()
