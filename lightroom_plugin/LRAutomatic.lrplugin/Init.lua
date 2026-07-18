@@ -5,7 +5,7 @@ _G.LRAutomaticShutdown = true
 _G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
 local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '4.8-global-lease-single-job-serial-previews-lr104-fix1'
+_G.LRAutomaticVersion = '4.9-skip-means-skip-preset-selective-preview-retry-lr104'
 _G.LRAutomaticLastError = nil
 
 LrTasks.startAsyncTask(function()
@@ -13,7 +13,7 @@ LrTasks.startAsyncTask(function()
     if myGeneration ~= _G.LRAutomaticGeneration then return end
 
     -- pcall somente no carregamento: chamadas SDK que cedem ao scheduler ficam fora dele.
-    local okRequire, Runner = pcall(require, 'JobRunner50')
+    local okRequire, Runner = pcall(require, 'JobRunner51')
     if not okRequire then
         _G.LRAutomaticLastError = tostring(Runner)
         return
