@@ -17,8 +17,6 @@ from .store import JobStore
 
 log = logging.getLogger("lrautomatic.homepicz")
 CONFIG_POLL_SECONDS = 1.0
-ACTIVE_JOB_STATUSES = {"queued", "running"}
-REUSABLE_JOB_STATUSES = {"queued", "running", "completed", "partial"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,46 +85,6 @@ def _write_state(settings: Settings, payload: dict[str, object]) -> None:
     )
 
 
-def _source_counts(settings: Settings, sources: list[ImportSource]) -> dict[str, int]:
-    allowed = {value.lower().lstrip(".") for value in settings.allowed_extensions}
-    counts: dict[str, int] = {}
-    for source in sources:
-        recursive = settings.homepicz_recursive if source.recursive is None else bool(source.recursive)
-        counts[source.path] = JobStore._count_source_photos(
-            Path(source.path), recursive=recursive, allowed_extensions=allowed
-        )
-    return counts
-
-
-def _find_equivalent_job(
-    settings: Settings,
-    store: JobStore,
-    collection_set: str,
-    sources: list[ImportSource],
-):
-    source_paths = {source.path for source in sources}
-    current_counts: dict[str, int] | None = None
-
-    for job in store.list():
-        if job.request.collection_set != collection_set:
-            continue
-        job_paths = {source.path for source in job.request.sources}
-        if job_paths != source_paths:
-            continue
-
-        if job.status in ACTIVE_JOB_STATUSES:
-            return job, "active"
-
-        if job.status in REUSABLE_JOB_STATUSES:
-            if current_counts is None:
-                current_counts = _source_counts(settings, sources)
-            previous_counts = {item.path: item.discovered for item in job.progress}
-            if previous_counts == current_counts:
-                return job, "unchanged"
-
-    return None, None
-
-
 def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) -> dict[str, object]:
     current = now or datetime.now()
     effective_today = operational_today(settings, current)
@@ -160,43 +118,33 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         "standard_preview_size": settings.homepicz_standard_preview_size,
         "smart_previews": settings.homepicz_smart_previews,
     }
+
+    # Cada ciclo cria um job novo, mesmo com fontes idênticas. O plugin consome
+    # a fila estritamente um job por vez e a política de duplicatas da importação
+    # continua sendo "skip", impedindo reimportação da mesma foto no catálogo.
     if sources:
-        existing, reason = _find_equivalent_job(settings, store, collection_set, sources)
-        if existing is not None:
-            result["status"] = "skipped_existing_job"
-            result["skip_reason"] = reason
-            result["job_id"] = existing.job_id
-            log.info(
-                "Nenhuma tarefa duplicada criada: job=%s motivo=%s status=%s",
-                existing.job_id,
-                reason,
-                existing.status,
-            )
-        else:
-            request = ImportJobRequest(
-                sources=sources,
-                collection_set=collection_set,
-                recursive=settings.homepicz_recursive,
-                build_standard_previews=settings.homepicz_standard_previews,
-                standard_preview_size=settings.homepicz_standard_preview_size,
-                build_smart_previews=settings.homepicz_smart_previews,
-                allowed_extensions=settings.allowed_extensions,
-                develop_preset_name=settings.homepicz_preset_name,
-                duplicate_policy="skip",
-            )
-            job = store.create(request)
-            result["job_id"] = job.job_id
+        request = ImportJobRequest(
+            sources=sources,
+            collection_set=collection_set,
+            recursive=settings.homepicz_recursive,
+            build_standard_previews=settings.homepicz_standard_previews,
+            standard_preview_size=settings.homepicz_standard_preview_size,
+            build_smart_previews=settings.homepicz_smart_previews,
+            allowed_extensions=settings.allowed_extensions,
+            develop_preset_name=settings.homepicz_preset_name,
+            duplicate_policy="skip",
+        )
+        job = store.create(request)
+        result["job_id"] = job.job_id
+        result["status"] = "job_created"
+        log.info("Novo job empilhado: job=%s fontes=%s", job.job_id, len(sources))
+
     _write_state(settings, result)
     return result
 
 
 class HomePiczScheduler:
-    def __init__(
-        self,
-        settings: Settings,
-        store: JobStore,
-        config_path: str | Path | None = None,
-    ):
+    def __init__(self, settings: Settings, store: JobStore, config_path: str | Path | None = None):
         self.settings = settings
         self.store = store
         self.config_path = Path(config_path).expanduser().resolve() if config_path else None
@@ -219,14 +167,12 @@ class HomePiczScheduler:
         current_mtime = self._config_mtime_ns()
         if current_mtime is None or current_mtime == self.config_mtime_ns:
             return False
-
         try:
             new_settings = load_settings(self.config_path)
             new_store = JobStore(new_settings)
         except Exception:
             log.exception("Configuração alterada, mas não pôde ser recarregada; mantendo valores anteriores")
             return False
-
         old_interval = self.settings.homepicz_interval_minutes
         self.settings = new_settings
         self.store = new_store
