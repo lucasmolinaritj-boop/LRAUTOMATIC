@@ -5,7 +5,7 @@ _G.LRAutomaticShutdown = true
 _G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
 local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '4.2-yield-safe-preview-isolation-lr104'
+_G.LRAutomaticVersion = '4.3-safe-missing-file-recovery-lr104'
 _G.LRAutomaticLastError = nil
 
 LrTasks.startAsyncTask(function()
@@ -13,7 +13,7 @@ LrTasks.startAsyncTask(function()
     LrTasks.sleep(3)
     if myGeneration ~= _G.LRAutomaticGeneration then return end
 
-    local okRequire, Runner = pcall(require, 'JobRunner')
+    local okRequire, Runner = pcall(require, 'SafeRunner')
     if not okRequire then
         _G.LRAutomaticLastError = tostring(Runner)
         return
@@ -23,9 +23,15 @@ LrTasks.startAsyncTask(function()
     _G.LRAutomaticLoopRunning = true
     _G.LRAutomaticLastError = nil
 
-    Runner.runLoop(function()
-        return _G.LRAutomaticShutdown == true or myGeneration ~= _G.LRAutomaticGeneration
+    local okRun, runError = pcall(function()
+        Runner.runLoop(function()
+            return _G.LRAutomaticShutdown == true or myGeneration ~= _G.LRAutomaticGeneration
+        end)
     end)
+
+    if not okRun then
+        _G.LRAutomaticLastError = tostring(runError)
+    end
 
     if myGeneration == _G.LRAutomaticGeneration then
         _G.LRAutomaticLoopRunning = false
