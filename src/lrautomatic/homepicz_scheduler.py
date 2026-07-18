@@ -17,6 +17,8 @@ from .store import JobStore
 
 log = logging.getLogger("lrautomatic.homepicz")
 CONFIG_POLL_SECONDS = 1.0
+ACTIVE_JOB_STATUSES = {"queued", "running"}
+REUSABLE_JOB_STATUSES = {"queued", "running", "completed", "partial"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +87,46 @@ def _write_state(settings: Settings, payload: dict[str, object]) -> None:
     )
 
 
+def _source_counts(settings: Settings, sources: list[ImportSource]) -> dict[str, int]:
+    allowed = {value.lower().lstrip(".") for value in settings.allowed_extensions}
+    counts: dict[str, int] = {}
+    for source in sources:
+        recursive = settings.homepicz_recursive if source.recursive is None else bool(source.recursive)
+        counts[source.path] = JobStore._count_source_photos(
+            Path(source.path), recursive=recursive, allowed_extensions=allowed
+        )
+    return counts
+
+
+def _find_equivalent_job(
+    settings: Settings,
+    store: JobStore,
+    collection_set: str,
+    sources: list[ImportSource],
+):
+    source_paths = {source.path for source in sources}
+    current_counts: dict[str, int] | None = None
+
+    for job in store.list():
+        if job.request.collection_set != collection_set:
+            continue
+        job_paths = {source.path for source in job.request.sources}
+        if job_paths != source_paths:
+            continue
+
+        if job.status in ACTIVE_JOB_STATUSES:
+            return job, "active"
+
+        if job.status in REUSABLE_JOB_STATUSES:
+            if current_counts is None:
+                current_counts = _source_counts(settings, sources)
+            previous_counts = {item.path: item.discovered for item in job.progress}
+            if previous_counts == current_counts:
+                return job, "unchanged"
+
+    return None, None
+
+
 def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) -> dict[str, object]:
     current = now or datetime.now()
     effective_today = operational_today(settings, current)
@@ -100,6 +142,7 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         else:
             missing.append(work_id)
 
+    collection_set = f"Home Picz - {window.label}"
     result: dict[str, object] = {
         "status": "completed",
         "at": current.isoformat(timespec="seconds"),
@@ -118,19 +161,31 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         "smart_previews": settings.homepicz_smart_previews,
     }
     if sources:
-        request = ImportJobRequest(
-            sources=sources,
-            collection_set=f"Home Picz - {window.label}",
-            recursive=settings.homepicz_recursive,
-            build_standard_previews=settings.homepicz_standard_previews,
-            standard_preview_size=settings.homepicz_standard_preview_size,
-            build_smart_previews=settings.homepicz_smart_previews,
-            allowed_extensions=settings.allowed_extensions,
-            develop_preset_name=settings.homepicz_preset_name,
-            duplicate_policy="skip",
-        )
-        job = store.create(request)
-        result["job_id"] = job.job_id
+        existing, reason = _find_equivalent_job(settings, store, collection_set, sources)
+        if existing is not None:
+            result["status"] = "skipped_existing_job"
+            result["skip_reason"] = reason
+            result["job_id"] = existing.job_id
+            log.info(
+                "Nenhuma tarefa duplicada criada: job=%s motivo=%s status=%s",
+                existing.job_id,
+                reason,
+                existing.status,
+            )
+        else:
+            request = ImportJobRequest(
+                sources=sources,
+                collection_set=collection_set,
+                recursive=settings.homepicz_recursive,
+                build_standard_previews=settings.homepicz_standard_previews,
+                standard_preview_size=settings.homepicz_standard_preview_size,
+                build_smart_previews=settings.homepicz_smart_previews,
+                allowed_extensions=settings.allowed_extensions,
+                develop_preset_name=settings.homepicz_preset_name,
+                duplicate_policy="skip",
+            )
+            job = store.create(request)
+            result["job_id"] = job.job_id
     _write_state(settings, result)
     return result
 
