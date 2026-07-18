@@ -13,7 +13,7 @@ LrTasks.startAsyncTask(function()
     if myGeneration ~= _G.LRAutomaticGeneration then return end
 
     -- pcall somente no carregamento: chamadas SDK que cedem ao scheduler ficam fora dele.
-    local okRequire, Runner = pcall(require, 'JobRunner48')
+    local okRequire, Runner = pcall(require, 'JobRunner49')
     if not okRequire then
         _G.LRAutomaticLastError = tostring(Runner)
         return
