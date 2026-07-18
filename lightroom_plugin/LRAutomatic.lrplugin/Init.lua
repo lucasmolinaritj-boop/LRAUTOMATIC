@@ -5,16 +5,16 @@ _G.LRAutomaticShutdown = true
 _G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
 local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '4.4-yield-safe-resilient-jobs-lr104'
+_G.LRAutomaticVersion = '4.5-no-yield-pcall-lr104'
 _G.LRAutomaticLastError = nil
 
 LrTasks.startAsyncTask(function()
     LrTasks.sleep(3)
     if myGeneration ~= _G.LRAutomaticGeneration then return end
 
-    -- pcall é seguro apenas para carregar o módulo. O loop não pode ficar dentro de
-    -- pcall porque as APIs do Lightroom fazem yield durante importação e espera.
-    local okRequire, Runner = pcall(require, 'JobRunner')
+    -- pcall é usado somente para carregar o arquivo. O runner e as operações SDK
+    -- ficam fora de pcall para permitir yield no Lightroom Classic 10.4.
+    local okRequire, Runner = pcall(require, 'JobRunner45')
     if not okRequire then
         _G.LRAutomaticLastError = tostring(Runner)
         return
