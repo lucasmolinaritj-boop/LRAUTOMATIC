@@ -5,7 +5,7 @@ _G.LRAutomaticShutdown = true
 _G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
 local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '4.5-no-yield-pcall-lr104'
+_G.LRAutomaticVersion = '4.6-preview-retry-10x-lr104'
 _G.LRAutomaticLastError = nil
 
 LrTasks.startAsyncTask(function()
@@ -14,7 +14,7 @@ LrTasks.startAsyncTask(function()
 
     -- pcall é usado somente para carregar o arquivo. O runner e as operações SDK
     -- ficam fora de pcall para permitir yield no Lightroom Classic 10.4.
-    local okRequire, Runner = pcall(require, 'JobRunner45')
+    local okRequire, Runner = pcall(require, 'JobRunner46')
     if not okRequire then
         _G.LRAutomaticLastError = tostring(Runner)
         return
