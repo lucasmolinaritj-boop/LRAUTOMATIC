@@ -12,11 +12,12 @@ from pathlib import Path
 
 from .catalogs import create_catalog
 from .config import Settings, load_settings
-from .models import ImportJobRequest, ImportSource
+from .models import ImportJob, ImportJobRequest, ImportSource
 from .store import JobStore
 
 log = logging.getLogger("lrautomatic.homepicz")
 CONFIG_POLL_SECONDS = 1.0
+HOME_PICZ_COLLECTION_PREFIX = "Home Picz - "
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,10 +86,121 @@ def _write_state(settings: Settings, payload: dict[str, object]) -> None:
     )
 
 
+def _is_homepicz_job(job: ImportJob) -> bool:
+    return bool(job.request.collection_set or "").startswith(HOME_PICZ_COLLECTION_PREFIX)
+
+
+def _cancel_obsolete_queued_jobs(
+    store: JobStore,
+    jobs: list[ImportJob],
+    current_collection_set: str,
+) -> list[str]:
+    cancelled: list[str] = []
+    for job in jobs:
+        if job.status != "queued" or not _is_homepicz_job(job):
+            continue
+        if job.request.collection_set == current_collection_set:
+            continue
+        job.status = "cancelled"
+        job.finished_at = job.finished_at or job.updated_at
+        job.add_event(
+            "superseded_period",
+            "Tarefa descartada após mudança do período operacional",
+            f"Período antigo: {job.request.collection_set}; período atual: {current_collection_set}.",
+            level="warning",
+        )
+        store.save(job)
+        cancelled.append(job.job_id)
+        log.warning(
+            "Job Home Picz obsoleto cancelado: job=%s antigo=%s atual=%s",
+            job.job_id,
+            job.request.collection_set,
+            current_collection_set,
+        )
+    return cancelled
+
+
 def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) -> dict[str, object]:
     current = now or datetime.now()
     effective_today = operational_today(settings, current)
     window = previous_business_window(effective_today)
+    collection_set = f"Home Picz - {window.label}"
+    jobs = store.list()
+
+    base_result: dict[str, object] = {
+        "at": current.isoformat(timespec="seconds"),
+        "calendar_date": current.date().isoformat(),
+        "operational_today": effective_today.isoformat(),
+        "day_rollover_time": settings.homepicz_day_rollover_time,
+        "rollover_applied": effective_today != current.date(),
+        "window": {"start": window.start.isoformat(), "end": window.end.isoformat()},
+        "collection_set": collection_set,
+    }
+
+    # Nenhum catálogo é criado/trocado e nenhum job novo é enfileirado enquanto
+    # qualquer tarefa estiver em execução. Quando ela terminar, o próximo ciclo
+    # recalcula o período antes de tomar qualquer decisão.
+    running_jobs = [job for job in jobs if job.status == "running"]
+    if running_jobs:
+        result = {
+            **base_result,
+            "status": "deferred_running_job",
+            "running_job_ids": [job.job_id for job in running_jobs],
+            "running_job_count": len(running_jobs),
+            "reason": "Há uma tarefa em execução; período será recalculado após a conclusão.",
+        }
+        log.info(
+            "Ciclo Home Picz adiado: %s job(s) em execução; nenhum catálogo ou job foi alterado",
+            len(running_jobs),
+        )
+        _write_state(settings, result)
+        return result
+
+    cancelled_job_ids = _cancel_obsolete_queued_jobs(store, jobs, collection_set)
+
+    # Se já existe um job do período correto, conserva apenas o mais antigo da
+    # fila e cancela duplicatas do mesmo período. Assim nunca se abre outro
+    # Lightroom nem se empilha o mesmo trabalho enquanto ele aguarda consumo.
+    current_queued = [
+        job
+        for job in jobs
+        if job.status == "queued"
+        and _is_homepicz_job(job)
+        and job.request.collection_set == collection_set
+    ]
+    current_queued.sort(key=lambda job: job.created_at)
+    if current_queued:
+        retained = current_queued[0]
+        duplicate_ids: list[str] = []
+        for duplicate in current_queued[1:]:
+            duplicate.status = "cancelled"
+            duplicate.finished_at = duplicate.finished_at or duplicate.updated_at
+            duplicate.add_event(
+                "duplicate_period",
+                "Tarefa duplicada descartada",
+                f"O job {retained.job_id} já representa o período {collection_set}.",
+                level="warning",
+            )
+            store.save(duplicate)
+            duplicate_ids.append(duplicate.job_id)
+        result = {
+            **base_result,
+            "status": "retained_current_job",
+            "job_id": retained.job_id,
+            "cancelled_obsolete_job_ids": cancelled_job_ids,
+            "cancelled_duplicate_job_ids": duplicate_ids,
+        }
+        log.info(
+            "Job atual mantido sem criar outro: job=%s período=%s duplicatas_canceladas=%s",
+            retained.job_id,
+            collection_set,
+            len(duplicate_ids),
+        )
+        _write_state(settings, result)
+        return result
+
+    # Só depois de provar que não há execução nem job atual pendente o scheduler
+    # prepara o catálogo e consulta as fontes do período vigente.
     catalog_path = _catalog_for_window(settings, window)
     ids = _fetch_ids(settings, window)
     sources: list[ImportSource] = []
@@ -100,15 +212,9 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         else:
             missing.append(work_id)
 
-    collection_set = f"Home Picz - {window.label}"
     result: dict[str, object] = {
+        **base_result,
         "status": "completed",
-        "at": current.isoformat(timespec="seconds"),
-        "calendar_date": current.date().isoformat(),
-        "operational_today": effective_today.isoformat(),
-        "day_rollover_time": settings.homepicz_day_rollover_time,
-        "rollover_applied": effective_today != current.date(),
-        "window": {"start": window.start.isoformat(), "end": window.end.isoformat()},
         "catalog_path": str(catalog_path),
         "ids": len(ids),
         "valid_sources": len(sources),
@@ -117,11 +223,9 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         "standard_previews": settings.homepicz_standard_previews,
         "standard_preview_size": settings.homepicz_standard_preview_size,
         "smart_previews": settings.homepicz_smart_previews,
+        "cancelled_obsolete_job_ids": cancelled_job_ids,
     }
 
-    # Cada ciclo cria um job novo, mesmo com fontes idênticas. O plugin consome
-    # a fila estritamente um job por vez e a política de duplicatas da importação
-    # continua sendo "skip", impedindo reimportação da mesma foto no catálogo.
     if sources:
         request = ImportJobRequest(
             sources=sources,
@@ -137,7 +241,13 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         job = store.create(request)
         result["job_id"] = job.job_id
         result["status"] = "job_created"
-        log.info("Novo job empilhado: job=%s fontes=%s", job.job_id, len(sources))
+        log.info(
+            "Novo job único criado: job=%s período=%s fontes=%s obsoletos_cancelados=%s",
+            job.job_id,
+            collection_set,
+            len(sources),
+            len(cancelled_job_ids),
+        )
 
     _write_state(settings, result)
     return result
