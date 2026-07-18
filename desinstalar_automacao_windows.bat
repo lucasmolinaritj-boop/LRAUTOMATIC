@@ -7,18 +7,18 @@ echo  DESINSTALADOR LRAUTOMATIC
 echo ================================================
 echo.
 echo Este processo remove:
-echo  - servico da API do Windows
+echo  - servidor da API em segundo plano
 echo  - tarefa agendada do agente Home Picz
 echo  - processos de automacao ainda ativos
 echo.
 echo NAO remove fotos nem catalogos do Lightroom.
 echo.
 
-net session >nul 2>&1
+fltmc >nul 2>&1
 if errorlevel 1 (
-  echo [ERRO] Execute este arquivo como Administrador.
-  pause
-  exit /b 1
+  echo [INFO] Solicitando permissao de administrador...
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+  exit /b
 )
 
 set /p CONFIRM=Digite SIM para continuar: 
@@ -29,23 +29,27 @@ if /I not "%CONFIRM%"=="SIM" (
 )
 
 echo.
-echo [1/4] Encerrando agente de sessao...
+echo [1/5] Encerrando agente Home Picz...
 schtasks /End /TN "LRAutomatic Session Agent" >nul 2>&1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process ^| Where-Object { $_.CommandLine -like '*lrautomatic.session_agent*' } ^| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*lrautomatic.session_agent*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 
-echo [2/4] Removendo tarefa agendada...
+echo [2/5] Encerrando servidor API...
+schtasks /End /TN "LRAutomatic API" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*lrautomatic.cli serve*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+
+echo [3/5] Removendo tarefas agendadas...
 schtasks /Delete /TN "LRAutomatic Session Agent" /F >nul 2>&1
+schtasks /Delete /TN "LRAutomatic API" /F >nul 2>&1
 
-echo [3/4] Parando e removendo servico da API...
+echo [4/5] Removendo servico legado, se existir...
 if exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m lrautomatic.windows_service stop >nul 2>&1
   ".venv\Scripts\python.exe" -m lrautomatic.windows_service remove >nul 2>&1
-) else (
-  sc stop LRAutomatic >nul 2>&1
-  sc delete LRAutomatic >nul 2>&1
 )
+sc.exe stop LRAutomatic >nul 2>&1
+sc.exe delete LRAutomatic >nul 2>&1
 
-echo [4/4] Limpando marcadores de execucao...
+echo [5/5] Limpando marcadores de execucao...
 if exist "%LOCALAPPDATA%\LRAutomatic\control\startup_flow.json" del /q "%LOCALAPPDATA%\LRAutomatic\control\startup_flow.json" >nul 2>&1
 if exist "%LOCALAPPDATA%\LRAutomatic\control\agent_open_catalog.txt" del /q "%LOCALAPPDATA%\LRAutomatic\control\agent_open_catalog.txt" >nul 2>&1
 
@@ -61,9 +65,6 @@ echo.
 echo ================================================
 echo  LRAutomatic removido com sucesso
 echo  Fotos e catalogos foram preservados.
-echo.
-echo  O plugin do Lightroom e removido separadamente em:
-echo  Arquivo ^> Gerenciador de plug-ins ^> Remover
 echo ================================================
 pause
 exit /b 0
