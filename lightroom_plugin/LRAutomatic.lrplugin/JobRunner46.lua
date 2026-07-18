@@ -10,11 +10,13 @@ local logger = LrLogger('LRAutomatic')
 logger:enable('logfile')
 
 local processing = false
+local activeJobPath = nil
+local activeJob = nil
 local previewBatches = {}
 local DEFAULT_EXTENSIONS = { cr2=true, cr3=true, dng=true }
-local PREVIEW_MAX_ATTEMPTS = 10
-local PREVIEW_RETRY_DELAY_SECONDS = 2
-local STANDARD_PREVIEW_TOTAL_TIMEOUT_SECONDS = 900
+local MAX_ATTEMPTS = 10
+local RETRY_DELAY_SECONDS = 60
+local STANDARD_PREVIEW_TOTAL_TIMEOUT_SECONDS = 6600
 
 local function homePath()
     local home = LrPathUtils.getStandardFilePath('home')
@@ -87,16 +89,71 @@ local function writeJson(path, value)
     return LrFileUtils.move(temp, path) == true
 end
 
-local function safeWriteJob(path, job)
-    if not writeJson(path, job) then plainLog('JOB_WRITE_FAILED path=' .. tostring(path)) end
-end
-
 local function appendJobEvent(job, stage, title, detail, level)
     job.events = job.events or {}
     table.insert(job.events, {
         at=timestamp(), stage=stage, title=title,
         detail=tostring(detail or ''), level=level or 'info'
     })
+end
+
+local function diskCancelled(jobPath)
+    local diskJob = readJson(jobPath)
+    return diskJob and tostring(diskJob.status) == 'cancelled'
+end
+
+local function safeWriteJob(path, job)
+    if diskCancelled(path) then
+        job.status = 'cancelled'
+        return false
+    end
+    if not writeJson(path, job) then
+        plainLog('JOB_WRITE_FAILED path=' .. tostring(path))
+        return false
+    end
+    return true
+end
+
+local function cancelHandles(batch)
+    if not batch then return end
+    batch.finished = true
+    for _, handle in ipairs(batch.handles or {}) do
+        pcall(function()
+            if handle and handle.cancel then handle:cancel() end
+        end)
+    end
+end
+
+local function finishCancelled(jobPath, job, detail)
+    local diskJob = readJson(jobPath)
+    if diskJob and tostring(diskJob.status) == 'cancelled' then job = diskJob end
+    job.status = 'cancelled'
+    job.finished_at = job.finished_at or timestamp()
+    job.current_source = nil
+    appendJobEvent(job, 'cancelled', 'Tarefa cancelada pelo usuário', detail or 'Processamento interrompido pelo plugin.', 'warning')
+    writeJson(jobPath, job)
+    cancelHandles(previewBatches[job.job_id])
+    previewBatches[job.job_id] = nil
+    processing = false
+    activeJobPath = nil
+    activeJob = nil
+    plainLog('JOB_CANCELLED id=' .. tostring(job.job_id))
+end
+
+local function isCancelled(jobPath, job)
+    if tostring(job.status) == 'cancelled' or diskCancelled(jobPath) then
+        finishCancelled(jobPath, job, 'A importação e as tentativas pendentes foram interrompidas.')
+        return true
+    end
+    return false
+end
+
+local function sleepInterruptible(jobPath, job, seconds)
+    for _ = 1, seconds do
+        if isCancelled(jobPath, job) then return false end
+        LrTasks.sleep(1)
+    end
+    return not isCancelled(jobPath, job)
 end
 
 local function normalizedExtension(path)
@@ -144,7 +201,6 @@ local function refreshTotals(job)
     end
 end
 
--- Nenhuma operação SDK que possa fazer yield fica dentro de pcall.
 local function withWrite(catalog, actionName, fn, detail)
     local ran, timedOut = false, false
     plainLog('WRITE_BEGIN action=' .. actionName .. ' detail=' .. tostring(detail))
@@ -177,9 +233,9 @@ local function ensureCollection(catalog, name)
     return findCollection(catalog, name), nil
 end
 
-local function importOne(catalog, photoPath)
+local function importOneAttempt(catalog, photoPath)
     if not photoPath or photoPath == '' then return nil, 'failed', 'caminho vazio' end
-    if not LrFileUtils.exists(photoPath) then return nil, 'missing', 'arquivo não encontrado' end
+    if not LrFileUtils.exists(photoPath) then return nil, 'failed', 'arquivo não encontrado' end
     local before = catalog:findPhotoByPath(photoPath)
     if before then return before, 'skipped', nil end
     local importedPhoto = nil
@@ -190,6 +246,27 @@ local function importOne(catalog, photoPath)
     local after = importedPhoto or catalog:findPhotoByPath(photoPath)
     if after then return after, 'imported', nil end
     return nil, 'failed', 'foto não apareceu no catálogo após addPhoto'
+end
+
+local function importOneWithRetry(catalog, photoPath, job, jobPath)
+    local lastError = nil
+    for attempt = 1, MAX_ATTEMPTS do
+        if isCancelled(jobPath, job) then return nil, 'cancelled', 'cancelado' end
+        job.import_attempts_total = (job.import_attempts_total or 0) + 1
+        job.current_photo = photoPath
+        job.current_photo_attempt = attempt
+        safeWriteJob(jobPath, job)
+        plainLog('IMPORT_ATTEMPT photo=' .. tostring(photoPath) .. ' attempt=' .. attempt)
+        local photo, result, err = importOneAttempt(catalog, photoPath)
+        if result == 'imported' or result == 'skipped' then return photo, result, nil end
+        lastError = err
+        if attempt < MAX_ATTEMPTS then
+            appendJobEvent(job, 'import_retry', 'Nova tentativa de importação agendada', tostring(photoPath) .. ' — tentativa ' .. (attempt + 1) .. ' de 10 em 1 minuto.', 'warning')
+            safeWriteJob(jobPath, job)
+            if not sleepInterruptible(jobPath, job, RETRY_DELAY_SECONDS) then return nil, 'cancelled', 'cancelado' end
+        end
+    end
+    return nil, 'failed', lastError or 'falha desconhecida após 10 tentativas'
 end
 
 local function findPresetByNameOrUuid(name, uuid)
@@ -210,7 +287,8 @@ local function findPresetByNameOrUuid(name, uuid)
     end
 end
 
-local function applyPreset(catalog, photos, job)
+local function applyPreset(catalog, photos, job, jobPath)
+    if isCancelled(jobPath, job) then return false end
     local request = job.request or {}
     local name, uuid = request.develop_preset_name, request.develop_preset_uuid
     if not name and not uuid then job.preset_status='not_requested'; return true end
@@ -229,55 +307,59 @@ end
 local function buildSmartPreviewsWithRetry(catalog, photos, job, jobPath)
     if not ((job.request or {}).build_smart_previews == true) then job.smart_previews_status='not_requested'; return true end
     if #photos == 0 then job.smart_previews_status='completed_no_photos'; return true end
-
     local pending = photos
     local totalCreated, totalExisted = 0, 0
     job.smart_previews_attempts = 0
     job.smart_previews_status = 'running'
-
-    for attempt = 1, PREVIEW_MAX_ATTEMPTS do
+    for attempt = 1, MAX_ATTEMPTS do
+        if isCancelled(jobPath, job) then return false end
         job.smart_previews_attempts = attempt
         job.smart_previews_pending = #pending
         safeWriteJob(jobPath, job)
         plainLog('SMART_PREVIEW_ATTEMPT attempt=' .. attempt .. ' pending=' .. #pending)
-
         local result = catalog:buildSmartPreviews(pending)
+        if isCancelled(jobPath, job) then return false end
         local created = result and result.created or {}
         local existed = result and result.existed or {}
-        local failed = result and result.failed or {}
+        local failed = result and result.failed or pending
         totalCreated = totalCreated + #created
         totalExisted = totalExisted + #existed
         pending = failed
-
         job.smart_previews_created = totalCreated
         job.smart_previews_existed = totalExisted
         job.smart_previews_failed = #pending
         job.smart_previews_pending = #pending
         safeWriteJob(jobPath, job)
-
         if #pending == 0 then
             job.smart_previews_status = 'completed'
-            appendJobEvent(job, 'smart_preview', 'Smart Previews concluídas', 'Concluídas em ' .. attempt .. ' tentativa(s).', 'info')
+            appendJobEvent(job, 'smart_preview', 'Visualizações inteligentes concluídas', 'Concluídas em ' .. attempt .. ' tentativa(s).', 'info')
             return true
         end
-        if attempt < PREVIEW_MAX_ATTEMPTS then LrTasks.sleep(PREVIEW_RETRY_DELAY_SECONDS) end
+        if attempt < MAX_ATTEMPTS then
+            appendJobEvent(job, 'smart_preview_retry', 'Nova tentativa de visualização inteligente agendada', #pending .. ' foto(s), nova tentativa em 1 minuto.', 'warning')
+            safeWriteJob(jobPath, job)
+            if not sleepInterruptible(jobPath, job, RETRY_DELAY_SECONDS) then return false end
+        end
     end
-
     job.smart_previews_status = 'failed_after_retries'
     job.smart_previews_failed = #pending
-    appendJobEvent(job, 'smart_preview_failed', 'Smart Previews falharam após 10 tentativas', #pending .. ' foto(s) ainda sem Smart Preview.', 'error')
-    plainLog('SMART_PREVIEW_GAVE_UP attempts=' .. PREVIEW_MAX_ATTEMPTS .. ' remaining=' .. #pending)
+    appendJobEvent(job, 'smart_preview_failed', 'Visualizações inteligentes falharam após 10 tentativas', #pending .. ' foto(s) ainda pendentes.', 'error')
     return false
 end
 
 local function finishJob(jobPath, job, failed)
+    if isCancelled(jobPath, job) then return end
     refreshTotals(job)
     job.current_source=nil
+    job.current_photo=nil
+    job.current_photo_attempt=nil
     job.finished_at=timestamp()
     job.status = failed and ((job.total_imported or 0) > 0 and 'partial' or 'failed') or 'completed'
     safeWriteJob(jobPath, job)
     previewBatches[job.job_id]=nil
     processing=false
+    activeJobPath=nil
+    activeJob=nil
     plainLog('JOB_END id=' .. tostring(job.job_id) .. ' status=' .. tostring(job.status) .. ' imported=' .. tostring(job.total_imported))
 end
 
@@ -285,6 +367,7 @@ local function startStandardPreviewsWithRetry(photos, jobPath, job, baseFailed)
     local request = job.request or {}
     if request.build_standard_previews ~= true then job.standard_previews_status='not_requested'; finishJob(jobPath, job, baseFailed); return end
     if #photos == 0 then job.standard_previews_status='completed_no_photos'; finishJob(jobPath, job, baseFailed); return end
+    if isCancelled(jobPath, job) then return end
 
     local size = math.max(256, math.min(16384, tonumber(request.standard_preview_size) or 2048))
     job.standard_previews_status='running'
@@ -299,6 +382,7 @@ local function startStandardPreviewsWithRetry(photos, jobPath, job, baseFailed)
     local function finishOne(photoKey, success, errorMessage)
         local active = previewBatches[job.job_id]
         if not active or active.finished then return end
+        if diskCancelled(jobPath) then finishCancelled(jobPath, job, 'Visualizações padrão interrompidas.'); return end
         if success then
             job.standard_previews_created = (job.standard_previews_created or 0) + 1
         else
@@ -311,11 +395,6 @@ local function startStandardPreviewsWithRetry(photos, jobPath, job, baseFailed)
         if active.remaining <= 0 then
             active.finished = true
             job.standard_previews_status = (job.standard_previews_failed or 0) > 0 and 'failed_after_retries' or 'completed'
-            if (job.standard_previews_failed or 0) > 0 then
-                appendJobEvent(job, 'standard_preview_failed', 'Visualizações padrão falharam após 10 tentativas', tostring(job.standard_previews_failed) .. ' foto(s) ainda sem visualização padrão.', 'error')
-            else
-                appendJobEvent(job, 'standard_preview', 'Visualizações padrão concluídas', 'Todas as fotos concluídas, com até 10 tentativas por foto.', 'info')
-            end
             finishJob(jobPath, job, baseFailed or (job.standard_previews_failed or 0) > 0)
         end
     end
@@ -324,22 +403,22 @@ local function startStandardPreviewsWithRetry(photos, jobPath, job, baseFailed)
     requestAttempt = function(photo, photoKey)
         local active = previewBatches[job.job_id]
         if not active or active.finished then return end
+        if diskCancelled(jobPath) then finishCancelled(jobPath, job, 'Visualizações padrão interrompidas.'); return end
         local attempt = (active.attempts[photoKey] or 0) + 1
         active.attempts[photoKey] = attempt
         job.standard_previews_attempts_total = (job.standard_previews_attempts_total or 0) + 1
         job.standard_previews_pending = active.remaining
         safeWriteJob(jobPath, job)
         plainLog('STANDARD_PREVIEW_ATTEMPT photo=' .. tostring(photoKey) .. ' attempt=' .. attempt)
-
         local handle = photo:requestJpegThumbnail(size, size, function(data, errorMessage)
             local current = previewBatches[job.job_id]
             if not current or current.finished then return end
+            if diskCancelled(jobPath) then finishCancelled(jobPath, job, 'Visualizações padrão interrompidas.'); return end
             if data ~= nil then
                 finishOne(photoKey, true, nil)
-            elseif attempt < PREVIEW_MAX_ATTEMPTS then
+            elseif attempt < MAX_ATTEMPTS then
                 LrTasks.startAsyncTask(function()
-                    LrTasks.sleep(PREVIEW_RETRY_DELAY_SECONDS)
-                    requestAttempt(photo, photoKey)
+                    if sleepInterruptible(jobPath, job, RETRY_DELAY_SECONDS) then requestAttempt(photo, photoKey) end
                 end)
             else
                 finishOne(photoKey, false, errorMessage)
@@ -348,12 +427,17 @@ local function startStandardPreviewsWithRetry(photos, jobPath, job, baseFailed)
         table.insert(active.handles, handle)
     end
 
-    for index, photo in ipairs(photos) do
-        requestAttempt(photo, tostring(index))
-    end
+    for index, photo in ipairs(photos) do requestAttempt(photo, tostring(index)) end
 
     LrTasks.startAsyncTask(function()
-        LrTasks.sleep(STANDARD_PREVIEW_TOTAL_TIMEOUT_SECONDS)
+        local elapsed = 0
+        while elapsed < STANDARD_PREVIEW_TOTAL_TIMEOUT_SECONDS do
+            local active = previewBatches[job.job_id]
+            if not active or active.finished then return end
+            if diskCancelled(jobPath) then finishCancelled(jobPath, job, 'Visualizações padrão interrompidas.'); return end
+            LrTasks.sleep(1)
+            elapsed = elapsed + 1
+        end
         local active = previewBatches[job.job_id]
         if not active or active.finished then return end
         active.finished = true
@@ -362,7 +446,6 @@ local function startStandardPreviewsWithRetry(photos, jobPath, job, baseFailed)
         job.standard_previews_pending = 0
         job.standard_previews_status = 'timeout_after_retries'
         job.error = job.error or 'Tempo máximo das tentativas de visualização padrão excedido.'
-        appendJobEvent(job, 'standard_preview_timeout', 'Visualizações padrão excederam o tempo máximo', remaining .. ' foto(s) ainda pendentes.', 'error')
         finishJob(jobPath, job, true)
     end)
 end
@@ -374,22 +457,24 @@ local function processSource(catalog, job, source, progress, jobPath, importedPh
     progress.skipped=progress.skipped or 0
     progress.failed=progress.failed or 0
     job.current_source=source.path
+    if isCancelled(jobPath, job) then return true end
     local recursive=source.recursive
     if recursive == nil then recursive=(job.request or {}).recursive == true end
     local files, collectError=collectFiles(source.path,recursive,allowed)
     if collectError then
         progress.discovered=0; progress.status='failed'; progress.error=collectError
-        appendJobEvent(job,'source_missing','Pasta ignorada sem travar o Lightroom',collectError,'error')
+        appendJobEvent(job,'source_missing','Pasta não pôde ser processada',collectError,'error')
         safeWriteJob(jobPath,job)
         return true
     end
     progress.discovered=#files
     safeWriteJob(jobPath,job)
-    plainLog('SOURCE_DISCOVERED path=' .. tostring(source.path) .. ' count=' .. tostring(#files))
     local photosForCollection={}
     for _, photoPath in ipairs(files) do
-        local photo,result,err=importOne(catalog,photoPath)
-        if result=='imported' then
+        if isCancelled(jobPath, job) then return true end
+        local photo,result,err=importOneWithRetry(catalog,photoPath,job,jobPath)
+        if result=='cancelled' then return true
+        elseif result=='imported' then
             progress.imported=progress.imported+1
             table.insert(photosForCollection,photo)
             table.insert(importedPhotos,photo)
@@ -400,12 +485,13 @@ local function processSource(catalog, job, source, progress, jobPath, importedPh
         else
             progress.failed=progress.failed+1
             progress.error=tostring(err) .. ': ' .. tostring(photoPath)
-            appendJobEvent(job,'file_missing','Arquivo ignorado',progress.error,'warning')
+            appendJobEvent(job,'import_failed','Importação falhou após 10 tentativas',progress.error,'error')
         end
         refreshTotals(job)
         safeWriteJob(jobPath,job)
         LrTasks.yield()
     end
+    if isCancelled(jobPath, job) then return true end
     local collectionName=source.collection
     if not collectionName or collectionName=='' then collectionName=LrPathUtils.leafName(source.path or '') end
     if (job.request or {}).create_collections ~= false and #photosForCollection > 0 then
@@ -425,13 +511,16 @@ end
 
 local function processJob(jobPath,job)
     if type(job)~='table' or tostring(job.status)~='queued' then processing=false; return false end
+    activeJobPath=jobPath
+    activeJob=job
     job.request=type(job.request)=='table' and job.request or {}
     job.progress=type(job.progress)=='table' and job.progress or {}
     local catalog=LrApplication.activeCatalog()
     if not catalog then
         job.status='failed'; job.error='nenhum catálogo ativo'; job.finished_at=timestamp()
-        safeWriteJob(jobPath,job); processing=false; return false
+        safeWriteJob(jobPath,job); processing=false; activeJobPath=nil; activeJob=nil; return false
     end
+    if isCancelled(jobPath, job) then return false end
     job.active_catalog_path=catalog:getPath()
     job.status='running'; job.error=nil; job.started_at=timestamp()
     safeWriteJob(jobPath,job)
@@ -440,25 +529,39 @@ local function processJob(jobPath,job)
     local sources=type(job.request.sources)=='table' and job.request.sources or {}
     local allowed=allowedExtensionTable(job.request)
     for index,source in ipairs(sources) do
+        if isCancelled(jobPath, job) then return false end
         local progress=job.progress[index]
         if type(progress)~='table' then
             progress={status='queued',discovered=0,imported=0,skipped=0,failed=0}
             job.progress[index]=progress
         end
         if processSource(catalog,job,source,progress,jobPath,importedPhotos,allowed) then failed=true end
+        if tostring(job.status)=='cancelled' then return false end
     end
-    local presetOk=applyPreset(catalog,importedPhotos,job)
+    if isCancelled(jobPath, job) then return false end
+    local presetOk=applyPreset(catalog,importedPhotos,job,jobPath)
     safeWriteJob(jobPath,job)
+    if tostring(job.status)=='cancelled' then return false end
     local smartOk=buildSmartPreviewsWithRetry(catalog,importedPhotos,job,jobPath)
     safeWriteJob(jobPath,job)
+    if tostring(job.status)=='cancelled' then return false end
     startStandardPreviewsWithRetry(importedPhotos,jobPath,job,failed or not presetOk or not smartOk)
     return true
 end
 
+local function pollActiveCancellation()
+    if processing and activeJobPath and activeJob and diskCancelled(activeJobPath) then
+        finishCancelled(activeJobPath, activeJob, 'Cancelamento detectado pelo loop do plugin.')
+        return true
+    end
+    return false
+end
+
 function Runner.processQueuedOnce()
-    if processing then return 0 end
+    if processing then pollActiveCancellation(); return 0 end
     LrFileUtils.createAllDirectories(jobsDir())
     writeState('runner_alive.txt',timestamp() .. '\njobs=' .. jobsDir())
+    local queued = {}
     local inspected=0
     for path in LrFileUtils.files(jobsDir()) do
         if isJobFile(path) then
@@ -467,12 +570,21 @@ function Runner.processQueuedOnce()
             if not job then
                 plainLog('JSON_INVALID path=' .. tostring(path) .. ' error=' .. tostring(readError))
             elseif tostring(job.status)=='queued' then
-                processing=true
-                writeState('last_scan.txt',timestamp() .. '\ninspected=' .. inspected .. '\nprocessed=1')
-                processJob(path,job)
-                return 1
+                table.insert(queued, {path=path, job=job})
             end
         end
+    end
+    table.sort(queued, function(a,b)
+        local ac=tostring(a.job.created_at or '')
+        local bc=tostring(b.job.created_at or '')
+        if ac == bc then return tostring(a.path) < tostring(b.path) end
+        return ac < bc
+    end)
+    if #queued > 0 then
+        processing=true
+        writeState('last_scan.txt',timestamp() .. '\ninspected=' .. inspected .. '\nprocessed=1\nqueued=' .. #queued)
+        processJob(queued[1].path,queued[1].job)
+        return 1
     end
     writeState('last_scan.txt',timestamp() .. '\ninspected=' .. inspected .. '\nprocessed=0')
     return 0
@@ -480,14 +592,16 @@ end
 
 function Runner.runLoop(shouldStop)
     LrFileUtils.createAllDirectories(jobsDir())
-    plainLog('Plugin V4.6 iniciado; previews com até 10 tentativas; monitorando ' .. jobsDir())
+    plainLog('Plugin V4.7 iniciado; fila FIFO; importação e previews com 10 tentativas a cada 1 minuto')
     while not shouldStop() do
+        pollActiveCancellation()
         writeState('heartbeat.txt',timestamp() .. '\nloop=running\nprocessing=' .. tostring(processing) .. '\njobs=' .. jobsDir())
         Runner.processQueuedOnce()
-        LrTasks.sleep(2)
+        LrTasks.sleep(1)
     end
+    if processing and activeJobPath and activeJob then finishCancelled(activeJobPath, activeJob, 'Plugin encerrado durante o processamento.') end
     processing=false
-    plainLog('Plugin V4.6 loop encerrado')
+    plainLog('Plugin V4.7 loop encerrado')
 end
 
 function Runner.getJobsDir() return jobsDir() end
