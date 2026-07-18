@@ -5,7 +5,7 @@ _G.LRAutomaticShutdown = true
 _G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
 local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '4.6-preview-retry-10x-lr104'
+_G.LRAutomaticVersion = '4.7-fifo-retry-10x-60s-cancel-lr104'
 _G.LRAutomaticLastError = nil
 
 LrTasks.startAsyncTask(function()
