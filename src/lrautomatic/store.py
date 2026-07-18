@@ -1,45 +1,113 @@
 from __future__ import annotations
-import json, os, tempfile
+
+import json
+import os
+import tempfile
 from pathlib import Path
+
 from .config import Settings
 from .models import ImportJob, ImportJobRequest, SourceProgress
 
+
 class JobStore:
     def __init__(self, settings: Settings):
-        self.settings=settings; self.settings.ensure_dirs()
-    def _job_path(self,job_id:str)->Path: return self.settings.jobs_dir/f'{job_id}.json'
+        self.settings = settings
+        self.settings.ensure_dirs()
+
+    def _job_path(self, job_id: str) -> Path:
+        return self.settings.jobs_dir / f"{job_id}.json"
+
     @staticmethod
-    def _atomic_write(path:Path,payload:dict)->None:
-        path.parent.mkdir(parents=True,exist_ok=True)
-        fd,temp_name=tempfile.mkstemp(prefix=path.stem,suffix='.tmp',dir=path.parent)
+    def _atomic_write(path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=path.stem, suffix=".tmp", dir=path.parent)
         try:
-            with os.fdopen(fd,'w',encoding='utf-8') as handle:
-                json.dump(payload,handle,ensure_ascii=False,indent=2); handle.flush(); os.fsync(handle.fileno())
-            os.replace(temp_name,path)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
         finally:
-            if os.path.exists(temp_name): os.unlink(temp_name)
-    def create(self,request:ImportJobRequest)->ImportJob:
-        progress=[SourceProgress(path=s.path,collection=s.collection or Path(s.path).name) for s in request.sources]
-        job=ImportJob(request=request,progress=progress)
-        if request.build_smart_previews: job.smart_previews_status='requested'
-        if request.develop_preset_name or request.develop_preset_uuid: job.preset_status='requested'
-        job.add_event('queue','Tarefa criada',f'{len(request.sources)} pasta(s) adicionada(s) à fila.')
-        self.save(job); return job
-    def save(self,job:ImportJob)->None:
-        job.touch(); self._atomic_write(self._job_path(job.job_id),job.model_dump(mode='json'))
-    def get(self,job_id:str)->ImportJob:
-        path=self._job_path(job_id)
-        if not path.exists(): raise FileNotFoundError(job_id)
-        return ImportJob.model_validate_json(path.read_text(encoding='utf-8'))
-    def list(self)->list[ImportJob]:
-        jobs=[]
-        for path in self.settings.jobs_dir.glob('job_*.json'):
-            try: jobs.append(ImportJob.model_validate_json(path.read_text(encoding='utf-8')))
-            except Exception: continue
-        return sorted(jobs,key=lambda j:j.created_at,reverse=True)
-    def cancel(self,job_id:str)->ImportJob:
-        job=self.get(job_id)
-        if job.status not in {'completed','failed','cancelled'}:
-            job.status='cancelled'; job.finished_at=job.finished_at or job.updated_at
-            job.add_event('cancelled','Tarefa cancelada pelo usuário',level='warning'); self.save(job)
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    @staticmethod
+    def _count_source_photos(path: Path, recursive: bool, allowed_extensions: set[str]) -> int:
+        try:
+            iterator = path.rglob("*") if recursive else path.iterdir()
+            return sum(
+                1
+                for item in iterator
+                if item.is_file() and item.suffix.lower().lstrip(".") in allowed_extensions
+            )
+        except OSError:
+            # A contagem antecipada é informativa. O Lightroom fará a descoberta definitiva.
+            return 0
+
+    def create(self, request: ImportJobRequest) -> ImportJob:
+        allowed_extensions = {extension.lower().lstrip(".") for extension in request.allowed_extensions}
+        progress: list[SourceProgress] = []
+
+        for source in request.sources:
+            recursive = request.recursive if source.recursive is None else source.recursive
+            discovered = self._count_source_photos(
+                Path(source.path),
+                recursive=bool(recursive),
+                allowed_extensions=allowed_extensions,
+            )
+            progress.append(
+                SourceProgress(
+                    path=source.path,
+                    collection=source.collection or Path(source.path).name,
+                    discovered=discovered,
+                )
+            )
+
+        total_discovered = sum(item.discovered for item in progress)
+        job = ImportJob(
+            request=request,
+            progress=progress,
+            total_discovered=total_discovered,
+        )
+        if request.build_standard_previews:
+            job.standard_previews_status = "requested"
+        if request.build_smart_previews:
+            job.smart_previews_status = "requested"
+        if request.develop_preset_name or request.develop_preset_uuid:
+            job.preset_status = "requested"
+
+        job.add_event(
+            "queue",
+            "Tarefa criada",
+            f"{len(request.sources)} pasta(s) adicionada(s) à fila; {total_discovered} foto(s) encontrada(s) antecipadamente.",
+        )
+        self.save(job)
+        return job
+
+    def save(self, job: ImportJob) -> None:
+        job.touch()
+        self._atomic_write(self._job_path(job.job_id), job.model_dump(mode="json"))
+
+    def get(self, job_id: str) -> ImportJob:
+        path = self._job_path(job_id)
+        if not path.exists():
+            raise FileNotFoundError(job_id)
+        return ImportJob.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def list(self) -> list[ImportJob]:
+        jobs = []
+        for path in self.settings.jobs_dir.glob("job_*.json"):
+            try:
+                jobs.append(ImportJob.model_validate_json(path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+        return sorted(jobs, key=lambda job: job.created_at, reverse=True)
+
+    def cancel(self, job_id: str) -> ImportJob:
+        job = self.get(job_id)
+        if job.status not in {"completed", "failed", "cancelled"}:
+            job.status = "cancelled"
+            job.finished_at = job.finished_at or job.updated_at
+            job.add_event("cancelled", "Tarefa cancelada pelo usuário", level="warning")
+            self.save(job)
         return job
