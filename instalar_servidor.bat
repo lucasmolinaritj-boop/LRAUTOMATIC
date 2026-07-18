@@ -12,8 +12,7 @@ rem O servico precisa de privilegios administrativos.
 fltmc >nul 2>&1
 if errorlevel 1 (
   echo [INFO] Solicitando permissao de administrador...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "Start-Process -FilePath $env:ComSpec -ArgumentList '/d','/c','""%~f0""' -Verb RunAs"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
   exit /b
 )
 
@@ -21,7 +20,9 @@ if not exist "instalar.bat" goto :erro_estrutura
 
 rem Instala/atualiza o pacote antes de registrar o servico.
 echo [1/7] Instalando ou atualizando o LRAutomatic...
+set "LRAUTOMATIC_NO_PAUSE=1"
 call "instalar.bat"
+set "LRAUTOMATIC_NO_PAUSE="
 if errorlevel 1 goto :erro_instalacao
 
 set "PYTHON_EXE=%CD%\.venv\Scripts\python.exe"
@@ -33,28 +34,18 @@ echo [2/7] Validando dependencias do servico...
 "%PYTHON_EXE%" -c "import lrautomatic.windows_service, servicemanager, win32serviceutil, uvicorn; print('[OK] Dependencias do servico carregadas.')"
 if errorlevel 1 goto :erro_dependencias
 
-rem Executa o pos-instalador do pywin32 quando estiver disponivel.
-for /f "delims=" %%F in ('dir /b /s "%CD%\.venv\Scripts\pywin32_postinstall.py" 2^>nul') do (
-  "%PYTHON_EXE%" "%%F" -install >nul 2>&1
-  goto :pywin32_pronto
-)
-:pywin32_pronto
-
 rem Remove a instalacao anterior para evitar ImagePath apontando para outra venv.
 echo [3/7] Removendo registro antigo, se existir...
 sc.exe query LRAutomatic >nul 2>&1
-if not errorlevel 1 (
-  sc.exe stop LRAutomatic >nul 2>&1
-  for /l %%I in (1,1,20) do (
-    sc.exe query LRAutomatic 2>nul | find /I "STOPPED" >nul && goto :servico_parado
-    timeout /t 1 /nobreak >nul
-  )
-  :servico_parado
-  "%PYTHON_EXE%" -m lrautomatic.windows_service remove >nul 2>&1
-  if errorlevel 1 sc.exe delete LRAutomatic >nul 2>&1
-  timeout /t 2 /nobreak >nul
-)
+if errorlevel 1 goto :registrar_servico
 
+sc.exe stop LRAutomatic >nul 2>&1
+timeout /t 4 /nobreak >nul
+"%PYTHON_EXE%" -m lrautomatic.windows_service remove >nul 2>&1
+if errorlevel 1 sc.exe delete LRAutomatic >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+:registrar_servico
 rem Registra novamente usando o Python da venv atual.
 echo [4/7] Registrando servico LRAutomatic...
 "%PYTHON_EXE%" -m lrautomatic.windows_service --startup auto install
@@ -72,14 +63,9 @@ sc.exe config LRAutomatic start= delayed-auto >nul
 sc.exe failure LRAutomatic reset= 86400 actions= restart/5000/restart/15000/restart/60000 >nul
 sc.exe failureflag LRAutomatic 1 >nul 2>&1
 
-rem Le host e porta diretamente do config para testar a instalacao real.
-for /f "tokens=1,2 delims=|" %%A in ('"%PYTHON_EXE%" -c "import json,pathlib; d=json.loads(pathlib.Path(r'%CD%\config.json').read_text(encoding='utf-8-sig')); print(str(d.get('host','127.0.0.1'))+'|'+str(d.get('port',45821)))"') do (
-  set "API_HOST=%%A"
-  set "API_PORT=%%B"
-)
-if not defined API_HOST set "API_HOST=127.0.0.1"
-if "%API_HOST%"=="0.0.0.0" set "API_HOST=127.0.0.1"
-if not defined API_PORT set "API_PORT=45821"
+set "API_HOST=127.0.0.1"
+set "API_PORT=45821"
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$j=Get-Content -Raw -LiteralPath '%CD%\config.json' | ConvertFrom-Json; if($j.port){$j.port}else{45821}"`) do set "API_PORT=%%P"
 
  echo [6/7] Iniciando servico...
 sc.exe start LRAutomatic >nul
@@ -96,8 +82,8 @@ for /l %%I in (1,1,20) do (
   )
   timeout /t 1 /nobreak >nul
 )
-:health_pronto
 
+:health_pronto
 if not defined HEALTH_OK goto :erro_health
 
  echo.
@@ -116,29 +102,38 @@ exit /b 0
 :erro_estrutura
 echo [ERRO] instalar.bat nao foi encontrado nesta pasta.
 goto :fim_erro
+
 :erro_instalacao
 echo [ERRO] A instalacao base do LRAutomatic falhou.
 goto :fim_erro
+
 :erro_python
 echo [ERRO] Python da venv nao encontrado em .venv\Scripts\python.exe.
 goto :fim_erro
+
 :erro_config
 echo [ERRO] config.json nao existe. Execute instalar.bat e abra o aplicativo ao menos uma vez.
 goto :fim_erro
+
 :erro_dependencias
 echo [ERRO] pywin32 ou outra dependencia do servico nao foi carregada.
 goto :fim_erro
+
 :erro_registro
 echo [ERRO] Nao foi possivel registrar o servico do Windows.
 goto :fim_erro
+
 :erro_registro_config
 echo [ERRO] Nao foi possivel registrar o caminho do config.json.
 goto :fim_erro
+
 :erro_inicio
 echo [ERRO] O Windows recusou a inicializacao do servico.
 goto :mostrar_diagnostico
+
 :erro_health
 echo [ERRO] O servico iniciou, mas a API nao respondeu no teste.
+
 :mostrar_diagnostico
 echo.
 echo Estado atual:
@@ -148,10 +143,7 @@ echo Eventos recentes do servico:
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-10)} -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -match 'Python|LRAutomatic' -or $_.Message -match 'LRAutomatic' } | Select-Object -First 8 TimeCreated,LevelDisplayName,Message | Format-List"
 echo.
-echo Verifique tambem:
-echo   %%LOCALAPPDATA%%\LRAutomatic\logs\windows-service.log
-echo   config.json
-
+echo Verifique tambem o arquivo windows-service.log dentro da pasta de logs configurada.
 goto :fim_erro
 
 :fim_erro
