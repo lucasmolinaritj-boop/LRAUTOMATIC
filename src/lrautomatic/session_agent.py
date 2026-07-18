@@ -156,7 +156,7 @@ def run_forever(config_path: str | Path = "config.json") -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     store = JobStore(settings)
-    scheduler = HomePiczScheduler(settings, store)
+    scheduler = HomePiczScheduler(settings, store, config_path=config_path)
     scheduler.start()
     _write_startup_state(settings, status="checking_homepicz_now")
     log.info(
