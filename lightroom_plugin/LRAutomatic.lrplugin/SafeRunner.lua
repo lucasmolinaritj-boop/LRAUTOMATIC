@@ -96,11 +96,10 @@ local function finalizeInterruptedJob(errorMessage)
     end
 end
 
-local function reloadRunner()
-    package.loaded['JobRunner'] = nil
+local function loadRunner()
     local ok, loaded = pcall(require, 'JobRunner')
-    if not ok then
-        appendLog('RUNNER_RELOAD_FAILED error=' .. tostring(loaded))
+    if not ok or type(loaded) ~= 'table' then
+        appendLog('RUNNER_LOAD_FAILED error=' .. tostring(loaded))
         runner = nil
         return false
     end
@@ -109,11 +108,13 @@ local function reloadRunner()
 end
 
 function SafeRunner.runLoop(shouldStop)
-    reloadRunner()
+    if not loadRunner() then
+        appendLog('SAFE_RUNNER_WAITING_FOR_JOBRUNNER')
+    end
     appendLog('SAFE_RUNNER_STARTED jobs=' .. jobsDir())
 
     while not shouldStop() do
-        if not runner and not reloadRunner() then
+        if not runner and not loadRunner() then
             LrTasks.sleep(2)
         else
             local ok, result = pcall(function()
@@ -123,7 +124,9 @@ function SafeRunner.runLoop(shouldStop)
             if not ok then
                 appendLog('RUNNER_EXCEPTION error=' .. tostring(result))
                 finalizeInterruptedJob(result)
-                reloadRunner()
+                if runner and type(runner.resetAfterFailure) == 'function' then
+                    pcall(function() runner.resetAfterFailure() end)
+                end
             end
             LrTasks.sleep(2)
         end
