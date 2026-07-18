@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shutil
 import tempfile
 from dataclasses import dataclass, fields
 from datetime import time
@@ -23,6 +24,16 @@ def parse_rollover_time(value: str | time) -> time:
     if parsed.second or parsed.microsecond:
         raise ValueError("O horário de virada deve usar apenas hora e minuto, no formato HH:MM.")
     return parsed
+
+
+def _shared_plugin_data_dir() -> Path:
+    """Pasta fixa compartilhada com o plugin do Lightroom.
+
+    O plugin Lua não lê config.json e, por isso, sempre procura a fila em
+    %LOCALAPPDATA%\\LRAutomatic. Manter a fila nesse caminho evita que a interface,
+    a API e o plugin acabem olhando diretórios diferentes quando data_dir é alterado.
+    """
+    return Path(os.path.expandvars(r"%LOCALAPPDATA%\LRAutomatic")).expanduser().resolve()
 
 
 @dataclass(slots=True)
@@ -50,7 +61,8 @@ class Settings:
 
     @property
     def jobs_dir(self) -> Path:
-        return self.data_dir / "jobs"
+        # Contrato da integração: Python e plugin Lightroom usam exatamente esta fila.
+        return _shared_plugin_data_dir() / "jobs"
 
     @property
     def responses_dir(self) -> Path:
@@ -81,8 +93,20 @@ class Settings:
         return parse_rollover_time(self.homepicz_day_rollover_time)
 
     def ensure_dirs(self) -> None:
+        legacy_jobs_dir = self.data_dir / "jobs"
         for path in (self.data_dir, self.jobs_dir, self.responses_dir, self.control_dir, self.logs_dir):
             path.mkdir(parents=True, exist_ok=True)
+
+        # Migra jobs existentes criados quando a fila ainda seguia data_dir.
+        try:
+            if legacy_jobs_dir.resolve() != self.jobs_dir.resolve() and legacy_jobs_dir.is_dir():
+                for source in legacy_jobs_dir.glob("job_*.json"):
+                    destination = self.jobs_dir / source.name
+                    if not destination.exists():
+                        shutil.move(str(source), str(destination))
+        except OSError:
+            # A migração não pode impedir a inicialização. Novos jobs já usarão a fila fixa.
+            pass
 
     def validate(self, *, check_paths: bool = False) -> list[str]:
         errors: list[str] = []
