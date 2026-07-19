@@ -42,8 +42,17 @@ def operational_today(settings: Settings, now: datetime | None = None) -> date:
 
 def previous_business_window(today: date | None = None) -> ImportWindow:
     today = today or date.today()
-    if today.weekday() == 0:
-        return ImportWindow(today - timedelta(days=3), today - timedelta(days=1))
+    weekday = today.weekday()
+
+    # Durante sábado, domingo e segunda, o período operacional permanece fixo
+    # em sexta-feira até sábado. Domingo nunca entra na importação automática.
+    if weekday == 5:  # sábado
+        return ImportWindow(today - timedelta(days=1), today)
+    if weekday == 6:  # domingo
+        return ImportWindow(today - timedelta(days=2), today - timedelta(days=1))
+    if weekday == 0:  # segunda-feira
+        return ImportWindow(today - timedelta(days=3), today - timedelta(days=2))
+
     yesterday = today - timedelta(days=1)
     return ImportWindow(yesterday, yesterday)
 
