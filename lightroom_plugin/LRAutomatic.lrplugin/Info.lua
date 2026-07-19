@@ -4,6 +4,7 @@ return {
     LrToolkitIdentifier = 'com.molinari.lrautomatic.v40',
     LrPluginName = 'LRAutomatic V4.0 Catálogo + Preset + Smart Preview',
     LrInitPlugin = 'Init.lua',
+    LrForceInitPlugin = true,
     LrShutdownPlugin = 'Shutdown.lua',
     LrPluginInfoProvider = 'PluginInfoProvider.lua',
     LrLibraryMenuItems = {
@@ -16,5 +17,5 @@ return {
             file = 'ProcessNow.lua',
         },
     },
-    VERSION = { major = 0, minor = 4, revision = 0, build = 104 },
+    VERSION = { major = 0, minor = 4, revision = 0, build = 105 },
 }
