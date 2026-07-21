@@ -59,6 +59,7 @@ class ImportSource(BaseModel):
     expected_count: int = Field(default=0, ge=0)
     work_id: str | None = None
     photographer: str | None = None
+    client: str | None = None
     service_name: str | None = None
     scheduled_at: str | None = None
 
@@ -77,6 +78,8 @@ class ImportJobRequest(BaseModel):
     recursive: bool = False
     create_collections: bool = True
     organize_collections_by_photographer: bool = False
+    organize_collections_by_client: bool = False
+    collection_organization_version: int = 0
     build_standard_previews: bool = True
     standard_preview_size: int = Field(default=2048, ge=256, le=16384)
     build_smart_previews: bool = False
@@ -111,7 +114,7 @@ class JobEvent(BaseModel):
 
 
 class ImportJob(BaseModel):
-    schema_version: int = 6
+    schema_version: int = 7
     job_id: str = Field(default_factory=lambda: f'job_{uuid4().hex}')
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -141,6 +144,7 @@ class ImportJob(BaseModel):
     collections_status: str = 'not_requested'
     collections_created: int = 0
     collection_sets_created: int = 0
+    collections_organization_version: int = 0
 
     def touch(self) -> None:
         self.updated_at = utc_now()
