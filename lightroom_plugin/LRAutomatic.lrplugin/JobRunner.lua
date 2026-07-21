@@ -1,25 +1,3 @@
-local LrTasks = import 'LrTasks'
-
-local BaseRunner = require 'JobRunner46'
-local CollectionOrganizer = require 'CollectionOrganizer'
-local Runner = {}
-
-function Runner.processQueuedOnce()
-    local processed = BaseRunner.processQueuedOnce()
-    CollectionOrganizer.processOnce()
-    return processed
-end
-
-function Runner.runLoop(shouldStop)
-    while not shouldStop() do
-        BaseRunner.processQueuedOnce()
-        CollectionOrganizer.processOnce()
-        LrTasks.sleep(1)
-    end
-end
-
-function Runner.getJobsDir()
-    return BaseRunner.getJobsDir()
-end
-
-return Runner
+-- Compatibilidade com instalações e entradas antigas do plugin.
+-- Todas as chamadas usam o runner ativo com supervisor, pausa e organização de coleções.
+return require 'JobRunner58'
