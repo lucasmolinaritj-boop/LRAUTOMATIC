@@ -6,17 +6,15 @@ from typing import Any
 
 from .automation_control import read_control
 from .desktop import STATUS_PT
-from .desktop_enhanced import EnhancedDesktopApp
+from .desktop_selective_cleanup import SelectiveCleanupDesktopApp
 
 
-class StableDesktopApp(EnhancedDesktopApp):
+class StableDesktopApp(SelectiveCleanupDesktopApp):
     """Monitor responsivo: leitura em background e atualização incremental da tabela."""
 
     MONITOR_INTERVAL_MS = 1000
 
     def __init__(self, config_path: str = "config.json") -> None:
-        # Estes atributos precisam existir antes do __init__ pai, pois ele chama os
-        # métodos de atualização que esta classe sobrescreve.
         self._monitor_refresh_inflight = False
         self._monitor_generation = 0
         self._last_jobs_snapshot: list[Any] = []
@@ -106,13 +104,11 @@ class StableDesktopApp(EnhancedDesktopApp):
         desired_set = set(desired_ids)
         current_ids = set(self.jobs_tree.get_children())
 
-        # Remove somente linhas que realmente deixaram de existir. Não limpa a tabela.
         for item_id in current_ids - desired_set:
             self.jobs_tree.delete(item_id)
             self._row_fingerprints.pop(item_id, None)
             self._render_fingerprints.pop(item_id, None)
 
-        # Insere ou altera apenas o que mudou e reposiciona sem piscar.
         for index, job in enumerate(visible):
             item_id = job.job_id
             values = self._row_values(job)
@@ -176,7 +172,6 @@ class StableDesktopApp(EnhancedDesktopApp):
             self.force_state.set(str(control.get("message") or ""))
 
     def _refresh_control_state(self) -> None:
-        # Reutiliza o snapshot já lido pelo monitor para não enumerar os jobs duas vezes.
         if self._last_control_snapshot is not None:
             self._apply_control_snapshot(self._last_control_snapshot, self._last_jobs_snapshot)
             return
@@ -191,8 +186,6 @@ class StableDesktopApp(EnhancedDesktopApp):
         if generation != self._monitor_generation:
             return
         self._monitor_refresh_inflight = False
-        # Falhas transitórias do Drive não apagam linhas nem transformam jobs em falha.
-        # O último estado válido permanece visível até a próxima leitura bem-sucedida.
         label = type(exc).__name__
         self.monitor_state.set(f"Drive ocupado ({label}); mantendo último estado")
 
