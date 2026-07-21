@@ -16,7 +16,7 @@ from .homepicz_scheduler import ImportWindow, current_import_window
 from .resilient_scanner import DEFAULT_EXTENSIONS, scan_folder_resilient
 
 RAW_EXTENSIONS = set(DEFAULT_EXTENSIONS)
-MAX_WORKERS = 8
+MAX_WORKERS = 4
 FOLDER_SCAN_TIMEOUT_SECONDS = 20.0
 
 
@@ -136,22 +136,20 @@ def _query_for_window(window: ImportWindow) -> str:
 def fetch_operational_works(settings: Settings, window: ImportWindow | None = None) -> tuple[ImportWindow, list[dict[str, str]]]:
     if not settings.homepicz_appscript_url:
         raise RuntimeError("Configure a URL do Google Apps Script nas Configurações.")
-
     target_window = window or current_import_window(settings)
     separator = "&" if "?" in settings.homepicz_appscript_url else "?"
     url = f"{settings.homepicz_appscript_url}{separator}{_query_for_window(target_window)}"
     request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "LRAutomatic/operational-inventory"})
     with urllib.request.urlopen(request, timeout=60) as response:
         payload = json.loads(response.read().decode("utf-8-sig"))
-
     if not isinstance(payload, dict):
         raise RuntimeError("Apps Script devolveu uma resposta inválida.")
     if payload.get("error"):
         raise RuntimeError(f"Apps Script: {payload['error']}")
 
     raw_works = payload.get("trabalhos")
+    works: list[dict[str, str]] = []
     if isinstance(raw_works, list):
-        works = []
         for raw in raw_works:
             if not isinstance(raw, dict):
                 continue
@@ -171,10 +169,8 @@ def fetch_operational_works(settings: Settings, window: ImportWindow | None = No
             raise RuntimeError("Apps Script respondeu sem os campos trabalhos ou ids.")
         works = [
             {"id": str(value).strip(), "fotografo": "Fotógrafo não informado", "servico": "", "status": "", "dataHora": ""}
-            for value in ids
-            if str(value).strip()
+            for value in ids if str(value).strip()
         ]
-
     unique = {item["id"]: item for item in works}
     return target_window, list(unique.values())
 
@@ -182,25 +178,10 @@ def fetch_operational_works(settings: Settings, window: ImportWindow | None = No
 def _scan_work(root: Path, work: dict[str, str]) -> OperationalFolder:
     work_id = work["id"]
     folder = root / work_id
-    exists = folder.is_dir()
-    counts = {"cr2": 0, "cr3": 0, "dng": 0}
-    latest_mtime: float | None = None
-    zero_byte_count = 0
-    timed_out = False
-    suspect_path: str | None = None
-    errors: list[str] = []
-
-    if exists:
-        result = scan_folder_resilient(folder, RAW_EXTENSIONS, timeout_seconds=FOLDER_SCAN_TIMEOUT_SECONDS)
-        counts.update(result.counts)
-        latest_mtime = result.latest_mtime
-        zero_byte_count = len(result.zero_byte_files)
-        timed_out = result.timed_out
-        suspect_path = result.suspect_path
-        errors.extend(result.errors)
-        if result.zero_byte_files:
-            errors.extend(f"Arquivo RAW com 0 byte: {path}" for path in result.zero_byte_files[:20])
-
+    result = scan_folder_resilient(folder, RAW_EXTENSIONS, timeout_seconds=FOLDER_SCAN_TIMEOUT_SECONDS)
+    errors = list(result.errors)
+    if result.zero_byte_files:
+        errors.extend(f"Arquivo RAW com 0 byte: {path}" for path in result.zero_byte_files[:20])
     return OperationalFolder(
         work_id=work_id,
         photographer=work.get("fotografo") or "Fotógrafo não informado",
@@ -208,14 +189,14 @@ def _scan_work(root: Path, work: dict[str, str]) -> OperationalFolder:
         status=work.get("status") or "",
         scheduled_at=work.get("dataHora") or "",
         path=str(folder),
-        folder_exists=exists,
-        cr2=counts["cr2"],
-        cr3=counts["cr3"],
-        dng=counts["dng"],
-        latest_mtime=latest_mtime,
-        zero_byte_count=zero_byte_count,
-        scan_timed_out=timed_out,
-        suspect_path=suspect_path,
+        folder_exists=result.folder_exists,
+        cr2=int(result.counts.get("cr2", 0)),
+        cr3=int(result.counts.get("cr3", 0)),
+        dng=int(result.counts.get("dng", 0)),
+        latest_mtime=result.latest_mtime,
+        zero_byte_count=result.zero_byte_count,
+        scan_timed_out=result.timed_out,
+        suspect_path=result.suspect_path,
         errors=tuple(errors[:50]),
     )
 
@@ -223,9 +204,6 @@ def _scan_work(root: Path, work: dict[str, str]) -> OperationalFolder:
 def scan_operational_inventory(settings: Settings, now: datetime | None = None) -> OperationalInventory:
     started = time.perf_counter()
     root = Path(settings.homepicz_photos_root).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Pasta Fotos do dia não encontrada: {root}")
-
     window = current_import_window(settings, now)
     window, works = fetch_operational_works(settings, window)
     folders: list[OperationalFolder] = []
@@ -234,12 +212,13 @@ def scan_operational_inventory(settings: Settings, now: datetime | None = None) 
     workers = max(1, min(MAX_WORKERS, len(works)))
     if works:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="operational-inventory") as executor:
-            futures = [executor.submit(_scan_work, root, work) for work in works]
+            futures = {executor.submit(_scan_work, root, work): work["id"] for work in works}
             for future in as_completed(futures):
+                work_id = futures[future]
                 try:
                     item = future.result()
                 except Exception as exc:
-                    errors.append(f"Falha inesperada na contagem: {exc}")
+                    errors.append(f"ID {work_id}: falha inesperada na contagem: {type(exc).__name__}: {exc}")
                     continue
                 folders.append(item)
                 errors.extend(f"ID {item.work_id}: {error}" for error in item.errors)
@@ -258,32 +237,30 @@ def _delete_folder_raw_files(root: Path, folder: OperationalFolder) -> RawDeleti
     candidate = Path(folder.path).resolve()
     deleted = failed = bytes_freed = 0
     errors: list[str] = []
-
     try:
         candidate.relative_to(root)
     except ValueError:
         return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 1, 0, (f"Caminho recusado fora da raiz: {candidate}",))
-
-    if not candidate.is_dir():
-        return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 0, 0, ())
-
+    if folder.scan_timed_out:
+        return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 1, 0, ("Exclusão recusada: a leitura desta pasta expirou.",))
     try:
-        paths = list(candidate.rglob("*"))
+        if not candidate.is_dir():
+            return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 0, 0, ())
+        for path in candidate.rglob("*"):
+            if path.suffix.lower() not in RAW_EXTENSIONS:
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                deleted += 1
+                bytes_freed += size
+            except OSError as exc:
+                failed += 1
+                if len(errors) < 50:
+                    errors.append(f"{path}: {exc}")
     except OSError as exc:
-        return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 1, 0, (f"{candidate}: {exc}",))
-
-    for path in paths:
-        if path.suffix.lower() not in RAW_EXTENSIONS:
-            continue
-        try:
-            size = path.stat().st_size
-            path.unlink()
-            deleted += 1
-            bytes_freed += size
-        except OSError as exc:
-            failed += 1
-            errors.append(f"{path}: {exc}")
-
+        failed += 1
+        errors.append(f"{candidate}: {exc}")
     return RawDeletionFolderResult(folder.work_id, folder.photographer, deleted, failed, bytes_freed, tuple(errors[:50]))
 
 
@@ -291,14 +268,23 @@ def delete_snapshot_raw_files(snapshot: OperationalInventory, work_ids: Iterable
     root = Path(snapshot.root).resolve()
     selected = snapshot.select(work_ids)
     results: list[RawDeletionFolderResult] = []
-
     workers = max(1, min(MAX_WORKERS, len(selected)))
     if selected:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="raw-cleanup") as executor:
-            futures = [executor.submit(_delete_folder_raw_files, root, folder) for folder in selected]
+            futures = {executor.submit(_delete_folder_raw_files, root, folder): folder for folder in selected}
             for future in as_completed(futures):
-                results.append(future.result())
-
+                folder = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append(RawDeletionFolderResult(
+                        folder.work_id,
+                        folder.photographer,
+                        0,
+                        1,
+                        0,
+                        (f"Falha inesperada: {type(exc).__name__}: {exc}",),
+                    ))
     results.sort(key=lambda item: (item.photographer.lower(), item.work_id.lower()))
     errors = [error for result in results for error in result.errors]
     return RawDeletionResult(
