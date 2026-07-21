@@ -7,10 +7,40 @@ from pathlib import Path
 from typing import Any
 
 CONTROL_FILENAME = "automation_control.json"
+PAUSE_FLAG_FILENAME = "automation_paused.flag"
+FORCE_ONCE_FLAG_FILENAME = "automation_force_once.flag"
 
 
 def control_path(settings: Any) -> Path:
     return settings.control_dir / CONTROL_FILENAME
+
+
+def runner_control_dir(settings: Any) -> Path:
+    # O plugin Lightroom usa a pasta fixa compartilhada da fila. Estes marcadores
+    # precisam ficar ao lado dela para continuarem visíveis mesmo se data_dir mudar.
+    return settings.jobs_dir.parent / "control"
+
+
+def pause_flag_path(settings: Any) -> Path:
+    return runner_control_dir(settings) / PAUSE_FLAG_FILENAME
+
+
+def force_once_flag_path(settings: Any) -> Path:
+    return runner_control_dir(settings) / FORCE_ONCE_FLAG_FILENAME
+
+
+def _write_flag(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    temp.write_text(text, encoding="utf-8")
+    os.replace(temp, path)
+
+
+def _remove_flag(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _default() -> dict[str, Any]:
@@ -28,12 +58,14 @@ def read_control(settings: Any) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, ValueError, TypeError):
-        return _default()
+        value = _default()
     if not isinstance(value, dict):
-        return _default()
+        value = _default()
     result = _default()
     result.update(value)
-    result["paused"] = bool(result.get("paused"))
+
+    # O marcador compartilhado é a autoridade para o runner do Lightroom.
+    result["paused"] = pause_flag_path(settings).is_file() or bool(result.get("paused"))
     result["force_next_requested"] = bool(result.get("force_next_requested"))
     return result
 
@@ -56,10 +88,17 @@ def set_paused(settings: Any, paused: bool, *, updated_by: str = "monitor") -> d
     value["paused"] = bool(paused)
     value["updated_by"] = updated_by
     value["message"] = (
-        "Automação pausada; a tarefa em andamento poderá terminar normalmente."
+        "Automação pausada; jobs continuam sendo criados, mas nenhum novo job será iniciado."
         if paused
         else "Automação ativa"
     )
+    if paused:
+        _write_flag(
+            pause_flag_path(settings),
+            f"paused_at={datetime.now().isoformat(timespec='seconds')}\nupdated_by={updated_by}\n",
+        )
+    else:
+        _remove_flag(pause_flag_path(settings))
     return write_control(settings, value)
 
 
@@ -69,6 +108,10 @@ def request_force_next(settings: Any, *, updated_by: str = "monitor") -> dict[st
     value["force_requested_at"] = datetime.now().isoformat(timespec="seconds")
     value["updated_by"] = updated_by
     value["message"] = "Próximo job solicitado; aguardando a tarefa atual terminar."
+    _write_flag(
+        force_once_flag_path(settings),
+        f"requested_at={value['force_requested_at']}\nupdated_by={updated_by}\n",
+    )
     return write_control(settings, value)
 
 
@@ -78,4 +121,6 @@ def consume_force_next(settings: Any, *, message: str) -> dict[str, Any]:
     value["force_consumed_at"] = datetime.now().isoformat(timespec="seconds")
     value["updated_by"] = "session-agent"
     value["message"] = message
+    # O marcador force_once é consumido pelo plugin apenas quando ele realmente
+    # inicia um job. Assim o bypass continua válido mesmo com a automação pausada.
     return write_control(settings, value)
