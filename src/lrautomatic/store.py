@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -11,9 +12,9 @@ from .models import ImportJob, ImportJobRequest, SourceProgress
 
 
 class JobStore:
-    READ_RETRIES = 2
-    READ_RETRY_DELAY_SECONDS = 0.03
-    MISSING_GRACE_REFRESHES = 5
+    READ_RETRIES = 3
+    READ_RETRY_DELAY_SECONDS = 0.05
+    MISSING_GRACE_REFRESHES = 12
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -21,6 +22,7 @@ class JobStore:
         self._last_good_jobs: dict[str, ImportJob] = {}
         self._missing_refreshes: dict[str, int] = {}
         self._file_signatures: dict[str, tuple[int, int]] = {}
+        self._lock = threading.RLock()
 
     def _job_path(self, job_id: str) -> Path:
         return self.settings.jobs_dir / f"{job_id}.json"
@@ -36,8 +38,11 @@ class JobStore:
                 os.fsync(handle.fileno())
             os.replace(temp_name, path)
         finally:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
+            try:
+                if os.path.exists(temp_name):
+                    os.unlink(temp_name)
+            except OSError:
+                pass
 
     @staticmethod
     def _signature(path: Path) -> tuple[int, int] | None:
@@ -48,8 +53,6 @@ class JobStore:
             return None
 
     def create(self, request: ImportJobRequest) -> ImportJob:
-        # A descoberta definitiva pertence ao executor, no instante em que o job
-        # começa. Isso evita travar a interface e impede contagens desatualizadas.
         progress = [
             SourceProgress(
                 path=source.path,
@@ -65,7 +68,6 @@ class JobStore:
             job.smart_previews_status = "requested"
         if request.develop_preset_name or request.develop_preset_uuid:
             job.preset_status = "requested"
-
         job.add_event(
             "queue",
             "Tarefa criada",
@@ -75,87 +77,104 @@ class JobStore:
         return job
 
     def save(self, job: ImportJob) -> None:
-        job.touch()
-        path = self._job_path(job.job_id)
-        self._atomic_write(path, job.model_dump(mode="json"))
-        self._last_good_jobs[job.job_id] = job
-        signature = self._signature(path)
-        if signature is not None:
-            self._file_signatures[job.job_id] = signature
-        self._missing_refreshes.pop(job.job_id, None)
+        with self._lock:
+            job.touch()
+            path = self._job_path(job.job_id)
+            self._atomic_write(path, job.model_dump(mode="json"))
+            self._last_good_jobs[job.job_id] = job
+            signature = self._signature(path)
+            if signature is not None:
+                self._file_signatures[job.job_id] = signature
+            self._missing_refreshes.pop(job.job_id, None)
 
     def _read_job_with_retry(self, path: Path) -> ImportJob | None:
         for attempt in range(self.READ_RETRIES):
             try:
-                return ImportJob.model_validate_json(path.read_text(encoding="utf-8"))
-            except (FileNotFoundError, PermissionError, OSError, ValueError):
+                text = path.read_text(encoding="utf-8")
+                if not text.strip():
+                    raise ValueError("JSON vazio")
+                return ImportJob.model_validate_json(text)
+            except (FileNotFoundError, PermissionError, OSError, ValueError, TypeError):
                 if attempt + 1 < self.READ_RETRIES:
-                    time.sleep(self.READ_RETRY_DELAY_SECONDS)
+                    time.sleep(self.READ_RETRY_DELAY_SECONDS * (attempt + 1))
             except Exception:
                 if attempt + 1 < self.READ_RETRIES:
-                    time.sleep(self.READ_RETRY_DELAY_SECONDS)
+                    time.sleep(self.READ_RETRY_DELAY_SECONDS * (attempt + 1))
         return None
 
     def get(self, job_id: str) -> ImportJob:
-        path = self._job_path(job_id)
-        signature = self._signature(path)
-        cached = self._last_good_jobs.get(job_id)
-        if cached is not None and signature is not None and self._file_signatures.get(job_id) == signature:
-            return cached
-        job = self._read_job_with_retry(path)
-        if job is not None:
-            self._last_good_jobs[job_id] = job
-            if signature is not None:
-                self._file_signatures[job_id] = signature
-            self._missing_refreshes.pop(job_id, None)
-            return job
-        if cached is not None:
-            return cached
-        raise FileNotFoundError(job_id)
-
-    def list(self) -> list[ImportJob]:
-        current: dict[str, ImportJob] = {}
-        try:
-            paths = list(self.settings.jobs_dir.glob("job_*.json"))
-        except OSError:
-            paths = []
-
-        for path in paths:
-            job_id = path.stem
+        with self._lock:
+            path = self._job_path(job_id)
             signature = self._signature(path)
             cached = self._last_good_jobs.get(job_id)
             if cached is not None and signature is not None and self._file_signatures.get(job_id) == signature:
-                job = cached
-            else:
-                job = self._read_job_with_retry(path)
-                if job is None:
-                    job = cached
+                return cached
+            job = self._read_job_with_retry(path)
             if job is not None:
-                current[job.job_id] = job
-                self._last_good_jobs[job.job_id] = job
+                self._last_good_jobs[job_id] = job
                 if signature is not None:
-                    self._file_signatures[job.job_id] = signature
-                self._missing_refreshes.pop(job.job_id, None)
-
-        for job_id, cached in list(self._last_good_jobs.items()):
-            if job_id in current:
-                continue
-            misses = self._missing_refreshes.get(job_id, 0) + 1
-            self._missing_refreshes[job_id] = misses
-            if misses <= self.MISSING_GRACE_REFRESHES:
-                current[job_id] = cached
-            else:
-                self._last_good_jobs.pop(job_id, None)
-                self._file_signatures.pop(job_id, None)
+                    self._file_signatures[job_id] = signature
                 self._missing_refreshes.pop(job_id, None)
+                return job
+            if cached is not None:
+                return cached
+            raise FileNotFoundError(job_id)
 
-        return sorted(current.values(), key=lambda job: job.created_at, reverse=True)
+    def list(self) -> list[ImportJob]:
+        with self._lock:
+            current: dict[str, ImportJob] = {}
+            try:
+                paths = list(self.settings.jobs_dir.glob("job_*.json"))
+                listing_ok = True
+            except OSError:
+                paths = []
+                listing_ok = False
+
+            # Uma falha transitória ao enumerar a pasta do Drive não é ausência de jobs.
+            # Mantemos integralmente o último snapshot conhecido e tentamos novamente depois.
+            if not listing_ok:
+                return sorted(self._last_good_jobs.values(), key=lambda job: job.created_at, reverse=True)
+
+            seen_ids: set[str] = set()
+            for path in paths:
+                job_id = path.stem
+                seen_ids.add(job_id)
+                signature = self._signature(path)
+                cached = self._last_good_jobs.get(job_id)
+                if cached is not None and signature is not None and self._file_signatures.get(job_id) == signature:
+                    job = cached
+                else:
+                    job = self._read_job_with_retry(path)
+                    if job is None:
+                        job = cached
+                if job is not None:
+                    current[job.job_id] = job
+                    self._last_good_jobs[job.job_id] = job
+                    if signature is not None:
+                        self._file_signatures[job.job_id] = signature
+                    self._missing_refreshes.pop(job.job_id, None)
+
+            for job_id, cached in list(self._last_good_jobs.items()):
+                if job_id in current:
+                    continue
+                # Só contabiliza ausência quando a listagem da pasta foi bem-sucedida.
+                misses = self._missing_refreshes.get(job_id, 0) + 1
+                self._missing_refreshes[job_id] = misses
+                if misses <= self.MISSING_GRACE_REFRESHES:
+                    current[job_id] = cached
+                else:
+                    self._last_good_jobs.pop(job_id, None)
+                    self._file_signatures.pop(job_id, None)
+                    self._missing_refreshes.pop(job_id, None)
+
+            return sorted(current.values(), key=lambda job: job.created_at, reverse=True)
 
     def cancel(self, job_id: str) -> ImportJob:
-        job = self.get(job_id)
-        if job.status not in {"completed", "failed", "cancelled"}:
-            job.status = "cancelled"
-            job.finished_at = job.finished_at or job.updated_at
-            job.add_event("cancelled", "Tarefa cancelada pelo usuário", level="warning")
-            self.save(job)
-        return job
+        with self._lock:
+            job = self.get(job_id)
+            if job.status not in {"completed", "failed", "cancelled"}:
+                job.status = "cancelled"
+                job.finished_at = job.finished_at or job.updated_at
+                job.add_event("cancelled", "Tarefa cancelada pelo usuário", level="warning")
+                self.save(job)
+            return job
