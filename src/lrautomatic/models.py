@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
+
 DEFAULT_PHOTO_EXTENSIONS = ['cr2', 'cr3', 'dng']
 KNOWN_PHOTO_EXTENSIONS = {
     'arw', 'cr2', 'cr3', 'dng', 'heic', 'heif', 'jpeg', 'jpg',
@@ -55,6 +56,7 @@ class ImportSource(BaseModel):
     collection: str | None = None
     recursive: bool | None = None
     keywords: list[str] = Field(default_factory=list)
+    expected_count: int = Field(default=0, ge=0)
 
     @field_validator('path')
     @classmethod
@@ -104,7 +106,7 @@ class JobEvent(BaseModel):
 
 
 class ImportJob(BaseModel):
-    schema_version: int = 4
+    schema_version: int = 5
     job_id: str = Field(default_factory=lambda: f'job_{uuid4().hex}')
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
