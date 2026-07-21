@@ -114,7 +114,7 @@ class JobEvent(BaseModel):
 
 
 class ImportJob(BaseModel):
-    schema_version: int = 7
+    schema_version: int = 8
     job_id: str = Field(default_factory=lambda: f'job_{uuid4().hex}')
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -145,6 +145,7 @@ class ImportJob(BaseModel):
     collections_created: int = 0
     collection_sets_created: int = 0
     collections_organization_version: int = 0
+    collections_run_once_token: str | None = None
 
     def touch(self) -> None:
         self.updated_at = utc_now()
