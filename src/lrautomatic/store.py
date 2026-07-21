@@ -57,11 +57,12 @@ class JobStore:
             SourceProgress(
                 path=source.path,
                 collection=source.collection or Path(source.path).name,
-                discovered=0,
+                discovered=max(0, int(source.expected_count or 0)),
             )
             for source in request.sources
         ]
-        job = ImportJob(request=request, progress=progress, total_discovered=0)
+        total_discovered = sum(item.discovered for item in progress)
+        job = ImportJob(request=request, progress=progress, total_discovered=total_discovered)
         if request.build_standard_previews:
             job.standard_previews_status = "requested"
         if request.build_smart_previews:
@@ -71,7 +72,10 @@ class JobStore:
         job.add_event(
             "queue",
             "Tarefa criada",
-            f"{len(request.sources)} pasta(s) adicionada(s) à fila; arquivos serão descobertos quando o job iniciar.",
+            (
+                f"{len(request.sources)} pasta(s) adicionada(s) à fila; "
+                f"total fechado em {total_discovered} foto(s) antes do início."
+            ),
         )
         self.save(job)
         return job
@@ -130,8 +134,6 @@ class JobStore:
                 paths = []
                 listing_ok = False
 
-            # Uma falha transitória ao enumerar a pasta do Drive não é ausência de jobs.
-            # Mantemos integralmente o último snapshot conhecido e tentamos novamente depois.
             if not listing_ok:
                 return sorted(self._last_good_jobs.values(), key=lambda job: job.created_at, reverse=True)
 
@@ -157,7 +159,6 @@ class JobStore:
             for job_id, cached in list(self._last_good_jobs.items()):
                 if job_id in current:
                     continue
-                # Só contabiliza ausência quando a listagem da pasta foi bem-sucedida.
                 misses = self._missing_refreshes.get(job_id, 0) + 1
                 self._missing_refreshes[job_id] = misses
                 if misses <= self.MISSING_GRACE_REFRESHES:
