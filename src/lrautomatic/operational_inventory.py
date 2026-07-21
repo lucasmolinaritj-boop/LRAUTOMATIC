@@ -9,13 +9,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 from .config import Settings
 from .homepicz_scheduler import ImportWindow, current_import_window
+from .resilient_scanner import DEFAULT_EXTENSIONS, scan_folder_resilient
 
-RAW_EXTENSIONS = {".cr2", ".cr3", ".dng"}
+RAW_EXTENSIONS = set(DEFAULT_EXTENSIONS)
 MAX_WORKERS = 8
+FOLDER_SCAN_TIMEOUT_SECONDS = 20.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +33,9 @@ class OperationalFolder:
     cr3: int
     dng: int
     latest_mtime: float | None
+    zero_byte_count: int = 0
+    scan_timed_out: bool = False
+    suspect_path: str | None = None
     errors: tuple[str, ...] = ()
 
     @property
@@ -38,9 +43,19 @@ class OperationalFolder:
         return self.cr2 + self.cr3 + self.dng
 
     @property
+    def has_scan_problem(self) -> bool:
+        return self.scan_timed_out or self.zero_byte_count > 0 or bool(self.errors)
+
+    @property
     def warning(self) -> str:
         if not self.folder_exists:
             return "⚠ Pasta não encontrada"
+        if self.scan_timed_out:
+            return "⛔ Leitura interrompida: possível bloqueio do Drive"
+        if self.zero_byte_count:
+            return f"⚠ {self.zero_byte_count} arquivo(s) RAW com 0 byte"
+        if self.errors:
+            return "⚠ Leitura incompleta"
         if self.total == 0:
             return "⚠ Sem arquivos RAW"
         return "OK"
@@ -72,11 +87,19 @@ class OperationalInventory:
 
     @property
     def empty_count(self) -> int:
-        return sum(item.total == 0 for item in self.folders)
+        return sum(item.total == 0 and not item.has_scan_problem for item in self.folders)
 
     @property
     def missing_count(self) -> int:
         return sum(not item.folder_exists for item in self.folders)
+
+    @property
+    def problem_count(self) -> int:
+        return sum(item.has_scan_problem for item in self.folders)
+
+    @property
+    def zero_byte_count(self) -> int:
+        return sum(item.zero_byte_count for item in self.folders)
 
     def select(self, work_ids: Iterable[str] | None = None) -> tuple[OperationalFolder, ...]:
         if work_ids is None:
@@ -159,33 +182,24 @@ def fetch_operational_works(settings: Settings, window: ImportWindow | None = No
 def _scan_work(root: Path, work: dict[str, str]) -> OperationalFolder:
     work_id = work["id"]
     folder = root / work_id
+    exists = folder.is_dir()
     counts = {"cr2": 0, "cr3": 0, "dng": 0}
     latest_mtime: float | None = None
+    zero_byte_count = 0
+    timed_out = False
+    suspect_path: str | None = None
     errors: list[str] = []
 
-    if folder.is_dir():
-        stack = [folder]
-        while stack:
-            current = stack.pop()
-            try:
-                with os.scandir(current) as entries:
-                    for entry in entries:
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                stack.append(Path(entry.path))
-                            elif entry.is_file(follow_symlinks=False):
-                                suffix = Path(entry.name).suffix.lower()
-                                if suffix in RAW_EXTENSIONS:
-                                    counts[suffix[1:]] += 1
-                                    try:
-                                        modified = entry.stat(follow_symlinks=False).st_mtime
-                                        latest_mtime = modified if latest_mtime is None else max(latest_mtime, modified)
-                                    except OSError:
-                                        pass
-                        except OSError as exc:
-                            errors.append(f"{entry.path}: {exc}")
-            except OSError as exc:
-                errors.append(f"{current}: {exc}")
+    if exists:
+        result = scan_folder_resilient(folder, RAW_EXTENSIONS, timeout_seconds=FOLDER_SCAN_TIMEOUT_SECONDS)
+        counts.update(result.counts)
+        latest_mtime = result.latest_mtime
+        zero_byte_count = len(result.zero_byte_files)
+        timed_out = result.timed_out
+        suspect_path = result.suspect_path
+        errors.extend(result.errors)
+        if result.zero_byte_files:
+            errors.extend(f"Arquivo RAW com 0 byte: {path}" for path in result.zero_byte_files[:20])
 
     return OperationalFolder(
         work_id=work_id,
@@ -194,12 +208,15 @@ def _scan_work(root: Path, work: dict[str, str]) -> OperationalFolder:
         status=work.get("status") or "",
         scheduled_at=work.get("dataHora") or "",
         path=str(folder),
-        folder_exists=folder.is_dir(),
+        folder_exists=exists,
         cr2=counts["cr2"],
         cr3=counts["cr3"],
         dng=counts["dng"],
         latest_mtime=latest_mtime,
-        errors=tuple(errors[:20]),
+        zero_byte_count=zero_byte_count,
+        scan_timed_out=timed_out,
+        suspect_path=suspect_path,
+        errors=tuple(errors[:50]),
     )
 
 
@@ -225,7 +242,7 @@ def scan_operational_inventory(settings: Settings, now: datetime | None = None) 
                     errors.append(f"Falha inesperada na contagem: {exc}")
                     continue
                 folders.append(item)
-                errors.extend(item.errors)
+                errors.extend(f"ID {item.work_id}: {error}" for error in item.errors)
 
     folders.sort(key=lambda item: (item.scheduled_at, item.work_id.lower()))
     return OperationalInventory(
@@ -233,7 +250,7 @@ def scan_operational_inventory(settings: Settings, now: datetime | None = None) 
         window=window,
         folders=tuple(folders),
         elapsed_seconds=time.perf_counter() - started,
-        errors=tuple(errors[:100]),
+        errors=tuple(errors[:200]),
     )
 
 
@@ -245,14 +262,7 @@ def _delete_folder_raw_files(root: Path, folder: OperationalFolder) -> RawDeleti
     try:
         candidate.relative_to(root)
     except ValueError:
-        return RawDeletionFolderResult(
-            work_id=folder.work_id,
-            photographer=folder.photographer,
-            deleted=0,
-            failed=1,
-            bytes_freed=0,
-            errors=(f"Caminho recusado fora da raiz: {candidate}",),
-        )
+        return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 1, 0, (f"Caminho recusado fora da raiz: {candidate}",))
 
     if not candidate.is_dir():
         return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 0, 0, ())
@@ -274,21 +284,10 @@ def _delete_folder_raw_files(root: Path, folder: OperationalFolder) -> RawDeleti
             failed += 1
             errors.append(f"{path}: {exc}")
 
-    return RawDeletionFolderResult(
-        work_id=folder.work_id,
-        photographer=folder.photographer,
-        deleted=deleted,
-        failed=failed,
-        bytes_freed=bytes_freed,
-        errors=tuple(errors[:50]),
-    )
+    return RawDeletionFolderResult(folder.work_id, folder.photographer, deleted, failed, bytes_freed, tuple(errors[:50]))
 
 
-def delete_snapshot_raw_files(
-    snapshot: OperationalInventory,
-    work_ids: Iterable[str] | None = None,
-) -> RawDeletionResult:
-    """Exclui CR2/CR3/DNG somente das pastas escolhidas do snapshot confirmado."""
+def delete_snapshot_raw_files(snapshot: OperationalInventory, work_ids: Iterable[str] | None = None) -> RawDeletionResult:
     root = Path(snapshot.root).resolve()
     selected = snapshot.select(work_ids)
     results: list[RawDeletionFolderResult] = []
