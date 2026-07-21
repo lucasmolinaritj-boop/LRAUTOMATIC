@@ -20,6 +20,22 @@ MAX_WORKERS = 4
 FOLDER_SCAN_TIMEOUT_SECONDS = 20.0
 
 
+def normalize_raw_extensions(extensions: Iterable[str] | None) -> frozenset[str]:
+    if extensions is None:
+        return frozenset(RAW_EXTENSIONS)
+    normalized = {
+        f".{str(value).strip().lower().lstrip('.')}"
+        for value in extensions
+        if str(value).strip().lstrip('.')
+    }
+    invalid = normalized - RAW_EXTENSIONS
+    if invalid:
+        raise ValueError(f"Extensão(ões) não permitida(s): {', '.join(sorted(invalid))}")
+    if not normalized:
+        raise ValueError("Selecione ao menos uma extensão RAW para excluir.")
+    return frozenset(normalized)
+
+
 @dataclass(frozen=True, slots=True)
 class OperationalFolder:
     work_id: str
@@ -41,6 +57,11 @@ class OperationalFolder:
     @property
     def total(self) -> int:
         return self.cr2 + self.cr3 + self.dng
+
+    def count_for_extensions(self, extensions: Iterable[str] | None) -> int:
+        selected = normalize_raw_extensions(extensions)
+        counts = {".cr2": self.cr2, ".cr3": self.cr3, ".dng": self.dng}
+        return sum(counts.get(extension, 0) for extension in selected)
 
     @property
     def has_scan_problem(self) -> bool:
@@ -125,6 +146,7 @@ class RawDeletionResult:
     bytes_freed: int
     errors: tuple[str, ...]
     folders: tuple[RawDeletionFolderResult, ...] = ()
+    extensions: tuple[str, ...] = ()
 
 
 def _query_for_window(window: ImportWindow) -> str:
@@ -233,7 +255,11 @@ def scan_operational_inventory(settings: Settings, now: datetime | None = None) 
     )
 
 
-def _delete_folder_raw_files(root: Path, folder: OperationalFolder) -> RawDeletionFolderResult:
+def _delete_folder_raw_files(
+    root: Path,
+    folder: OperationalFolder,
+    extensions: frozenset[str],
+) -> RawDeletionFolderResult:
     candidate = Path(folder.path).resolve()
     deleted = failed = bytes_freed = 0
     errors: list[str] = []
@@ -247,7 +273,7 @@ def _delete_folder_raw_files(root: Path, folder: OperationalFolder) -> RawDeleti
         if not candidate.is_dir():
             return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 0, 0, ())
         for path in candidate.rglob("*"):
-            if path.suffix.lower() not in RAW_EXTENSIONS:
+            if path.suffix.lower() not in extensions:
                 continue
             try:
                 size = path.stat().st_size
@@ -264,14 +290,22 @@ def _delete_folder_raw_files(root: Path, folder: OperationalFolder) -> RawDeleti
     return RawDeletionFolderResult(folder.work_id, folder.photographer, deleted, failed, bytes_freed, tuple(errors[:50]))
 
 
-def delete_snapshot_raw_files(snapshot: OperationalInventory, work_ids: Iterable[str] | None = None) -> RawDeletionResult:
+def delete_snapshot_raw_files(
+    snapshot: OperationalInventory,
+    work_ids: Iterable[str] | None = None,
+    extensions: Iterable[str] | None = None,
+) -> RawDeletionResult:
+    selected_extensions = normalize_raw_extensions(extensions)
     root = Path(snapshot.root).resolve()
     selected = snapshot.select(work_ids)
     results: list[RawDeletionFolderResult] = []
     workers = max(1, min(MAX_WORKERS, len(selected)))
     if selected:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="raw-cleanup") as executor:
-            futures = {executor.submit(_delete_folder_raw_files, root, folder): folder for folder in selected}
+            futures = {
+                executor.submit(_delete_folder_raw_files, root, folder, selected_extensions): folder
+                for folder in selected
+            }
             for future in as_completed(futures):
                 folder = futures[future]
                 try:
@@ -293,4 +327,5 @@ def delete_snapshot_raw_files(snapshot: OperationalInventory, work_ids: Iterable
         bytes_freed=sum(item.bytes_freed for item in results),
         errors=tuple(errors[:100]),
         folders=tuple(results),
+        extensions=tuple(sorted(selected_extensions)),
     )
