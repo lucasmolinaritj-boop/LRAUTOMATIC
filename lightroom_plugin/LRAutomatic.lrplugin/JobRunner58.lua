@@ -5,6 +5,7 @@ local LrFileUtils = import 'LrFileUtils'
 local LrPathUtils = import 'LrPathUtils'
 
 local Runner = require 'JobRunner57'
+local CollectionOrganizer = require 'CollectionOrganizer'
 local originalProcessQueuedOnce = Runner.processQueuedOnce
 
 local function homePath()
@@ -42,13 +43,22 @@ local function consumeForceOnce()
 end
 
 function Runner.processQueuedOnce()
+    -- A organização de jobs já finalizados continua funcionando mesmo quando o
+    -- início de novas importações está pausado.
+    CollectionOrganizer.processOnce()
+
     if LrFileUtils.exists(pauseFlagPath()) then
         if consumeForceOnce() then
-            return originalProcessQueuedOnce()
+            local processed = originalProcessQueuedOnce()
+            CollectionOrganizer.processOnce()
+            return processed
         end
         return 0
     end
-    return originalProcessQueuedOnce()
+
+    local processed = originalProcessQueuedOnce()
+    CollectionOrganizer.processOnce()
+    return processed
 end
 
 return Runner
