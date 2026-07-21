@@ -43,16 +43,12 @@ def operational_today(settings: Settings, now: datetime | None = None) -> date:
 def previous_business_window(today: date | None = None) -> ImportWindow:
     today = today or date.today()
     weekday = today.weekday()
-
-    # Durante sábado, domingo e segunda, o período operacional permanece fixo
-    # em sexta-feira até sábado. Domingo nunca entra na importação automática.
-    if weekday == 5:  # sábado
+    if weekday == 5:
         return ImportWindow(today - timedelta(days=1), today)
-    if weekday == 6:  # domingo
+    if weekday == 6:
         return ImportWindow(today - timedelta(days=2), today - timedelta(days=1))
-    if weekday == 0:  # segunda-feira
+    if weekday == 0:
         return ImportWindow(today - timedelta(days=3), today - timedelta(days=2))
-
     yesterday = today - timedelta(days=1)
     return ImportWindow(yesterday, yesterday)
 
@@ -99,6 +95,58 @@ def _is_homepicz_job(job: ImportJob) -> bool:
     return bool(job.request.collection_set or "").startswith(HOME_PICZ_COLLECTION_PREFIX)
 
 
+def _normalize_path(value: str) -> str:
+    return str(Path(value).expanduser().resolve()).casefold()
+
+
+def _count_source_files(folder: Path, recursive: bool, allowed_extensions: set[str]) -> int:
+    iterator = folder.rglob("*") if recursive else folder.iterdir()
+    count = 0
+    try:
+        for path in iterator:
+            try:
+                if not path.is_file():
+                    continue
+                if path.suffix.lower().lstrip(".") not in allowed_extensions:
+                    continue
+                if path.stat().st_size <= 0:
+                    continue
+                count += 1
+            except (OSError, PermissionError):
+                continue
+    except (OSError, PermissionError):
+        return 0
+    return count
+
+
+def _covered_counts(jobs: list[ImportJob], collection_set: str) -> dict[str, int]:
+    covered: dict[str, int] = {}
+    for job in jobs:
+        if not _is_homepicz_job(job) or job.request.collection_set != collection_set:
+            continue
+        status = str(job.status)
+        active = status in {"queued", "running"}
+        terminal = status in {"completed", "partial"}
+        if not active and not terminal:
+            continue
+
+        progress_by_path = {_normalize_path(item.path): item for item in job.progress}
+        for source in job.request.sources:
+            key = _normalize_path(source.path)
+            progress = progress_by_path.get(key)
+            source_completed = active or (
+                terminal and progress is not None and str(progress.status) == "completed"
+            )
+            if not source_completed:
+                continue
+            known = max(
+                int(source.expected_count or 0),
+                int(progress.discovered if progress is not None else 0),
+            )
+            covered[key] = max(covered.get(key, 0), known)
+    return covered
+
+
 def _cancel_obsolete_queued_jobs(
     store: JobStore,
     jobs: list[ImportJob],
@@ -106,7 +154,7 @@ def _cancel_obsolete_queued_jobs(
 ) -> list[str]:
     cancelled: list[str] = []
     for job in jobs:
-        if job.status != "queued" or not _is_homepicz_job(job):
+        if str(job.status) != "queued" or not _is_homepicz_job(job):
             continue
         if job.request.collection_set == current_collection_set:
             continue
@@ -120,12 +168,6 @@ def _cancel_obsolete_queued_jobs(
         )
         store.save(job)
         cancelled.append(job.job_id)
-        log.warning(
-            "Job Home Picz obsoleto cancelado: job=%s antigo=%s atual=%s",
-            job.job_id,
-            job.request.collection_set,
-            current_collection_set,
-        )
     return cancelled
 
 
@@ -146,88 +188,68 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         "collection_set": collection_set,
     }
 
-    # Nenhum catálogo é criado/trocado e nenhum job novo é enfileirado enquanto
-    # qualquer tarefa estiver em execução. Quando ela terminar, o próximo ciclo
-    # recalcula o período antes de tomar qualquer decisão.
-    running_jobs = [job for job in jobs if job.status == "running"]
-    if running_jobs:
+    running_jobs = [job for job in jobs if str(job.status) == "running"]
+    running_other_period = [
+        job for job in running_jobs if job.request.collection_set != collection_set
+    ]
+    if running_other_period:
         result = {
             **base_result,
-            "status": "deferred_running_job",
-            "running_job_ids": [job.job_id for job in running_jobs],
-            "running_job_count": len(running_jobs),
-            "reason": "Há uma tarefa em execução; período será recalculado após a conclusão.",
+            "status": "deferred_catalog_switch",
+            "running_job_ids": [job.job_id for job in running_other_period],
+            "reason": "Há um job de outro período em execução; a troca de catálogo foi adiada.",
         }
-        log.info(
-            "Ciclo Home Picz adiado: %s job(s) em execução; nenhum catálogo ou job foi alterado",
-            len(running_jobs),
-        )
         _write_state(settings, result)
         return result
 
     cancelled_job_ids = _cancel_obsolete_queued_jobs(store, jobs, collection_set)
-
-    # Se já existe um job do período correto, conserva apenas o mais antigo da
-    # fila e cancela duplicatas do mesmo período. Assim nunca se abre outro
-    # Lightroom nem se empilha o mesmo trabalho enquanto ele aguarda consumo.
-    current_queued = [
-        job
-        for job in jobs
-        if job.status == "queued"
-        and _is_homepicz_job(job)
-        and job.request.collection_set == collection_set
-    ]
-    current_queued.sort(key=lambda job: job.created_at)
-    if current_queued:
-        retained = current_queued[0]
-        duplicate_ids: list[str] = []
-        for duplicate in current_queued[1:]:
-            duplicate.status = "cancelled"
-            duplicate.finished_at = duplicate.finished_at or duplicate.updated_at
-            duplicate.add_event(
-                "duplicate_period",
-                "Tarefa duplicada descartada",
-                f"O job {retained.job_id} já representa o período {collection_set}.",
-                level="warning",
-            )
-            store.save(duplicate)
-            duplicate_ids.append(duplicate.job_id)
-        result = {
-            **base_result,
-            "status": "retained_current_job",
-            "job_id": retained.job_id,
-            "cancelled_obsolete_job_ids": cancelled_job_ids,
-            "cancelled_duplicate_job_ids": duplicate_ids,
-        }
-        log.info(
-            "Job atual mantido sem criar outro: job=%s período=%s duplicatas_canceladas=%s",
-            retained.job_id,
-            collection_set,
-            len(duplicate_ids),
-        )
-        _write_state(settings, result)
-        return result
-
-    # Só depois de provar que não há execução nem job atual pendente o scheduler
-    # prepara o catálogo e consulta as fontes do período vigente.
     catalog_path = _catalog_for_window(settings, window)
     ids = _fetch_ids(settings, window)
+
+    allowed = {value.lower().lstrip(".") for value in settings.allowed_extensions}
+    recursive = bool(settings.homepicz_recursive)
+    covered = _covered_counts(jobs, collection_set)
+
     sources: list[ImportSource] = []
     missing: list[str] = []
+    unchanged: list[str] = []
+    empty: list[str] = []
+
     for work_id in ids:
         folder = settings.homepicz_photos_root / work_id
-        if folder.is_dir():
-            sources.append(ImportSource(path=str(folder), collection=work_id))
-        else:
+        if not folder.is_dir():
             missing.append(work_id)
+            continue
 
+        expected_count = _count_source_files(folder, recursive, allowed)
+        if expected_count <= 0:
+            empty.append(work_id)
+            continue
+
+        key = _normalize_path(str(folder))
+        if expected_count <= covered.get(key, -1):
+            unchanged.append(work_id)
+            continue
+
+        sources.append(
+            ImportSource(
+                path=str(folder),
+                collection=work_id,
+                expected_count=expected_count,
+            )
+        )
+
+    total_photos = sum(source.expected_count for source in sources)
     result: dict[str, object] = {
         **base_result,
-        "status": "completed",
+        "status": "up_to_date",
         "catalog_path": str(catalog_path),
         "ids": len(ids),
-        "valid_sources": len(sources),
+        "new_or_expanded_sources": len(sources),
+        "known_unchanged_sources": len(unchanged),
+        "expected_photos": total_photos,
         "missing_ids": missing,
+        "empty_ids": empty,
         "allowed_extensions": settings.allowed_extensions,
         "standard_previews": settings.homepicz_standard_previews,
         "standard_preview_size": settings.homepicz_standard_preview_size,
@@ -239,7 +261,7 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         request = ImportJobRequest(
             sources=sources,
             collection_set=collection_set,
-            recursive=settings.homepicz_recursive,
+            recursive=recursive,
             build_standard_previews=settings.homepicz_standard_previews,
             standard_preview_size=settings.homepicz_standard_preview_size,
             build_smart_previews=settings.homepicz_smart_previews,
@@ -250,12 +272,24 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         job = store.create(request)
         result["job_id"] = job.job_id
         result["status"] = "job_created"
+        result["queue_mode"] = "incremental"
+        result["running_job_count"] = len(running_jobs)
         log.info(
-            "Novo job único criado: job=%s período=%s fontes=%s obsoletos_cancelados=%s",
+            "Job incremental criado: job=%s período=%s fontes=%s fotos=%s em_execução=%s",
             job.job_id,
             collection_set,
             len(sources),
-            len(cancelled_job_ids),
+            total_photos,
+            len(running_jobs),
+        )
+    else:
+        log.info(
+            "Nenhum trabalho novo: período=%s ids=%s inalterados=%s vazios=%s ausentes=%s",
+            collection_set,
+            len(ids),
+            len(unchanged),
+            len(empty),
+            len(missing),
         )
 
     _write_state(settings, result)
@@ -311,7 +345,7 @@ class HomePiczScheduler:
         self.thread = threading.Thread(target=self._loop, name="HomePiczScheduler", daemon=True)
         self.thread.start()
         log.info(
-            "Scheduler Home Picz iniciado; primeira verificação imediata; virada operacional às %s",
+            "Scheduler Home Picz iniciado; fila incremental; virada operacional às %s",
             self.settings.homepicz_day_rollover_time,
         )
 
