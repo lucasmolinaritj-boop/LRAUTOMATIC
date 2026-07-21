@@ -18,16 +18,21 @@ FETCH_ATTEMPTS = 4
 FETCH_TIMEOUT_SECONDS = 25
 
 
-def _fetch_ids_with_retry(settings: Settings, window: homepicz_scheduler.ImportWindow) -> list[str]:
-    """Consulta o Apps Script tolerando timeout transitório sem abortar o ciclo inteiro."""
+def _fetch_work_items_with_retry(
+    settings: Settings,
+    window: homepicz_scheduler.ImportWindow,
+) -> list[homepicz_scheduler.WorkItem]:
+    """Consulta detalhes dos trabalhos tolerando timeouts transitórios."""
     if not settings.homepicz_appscript_url:
         raise RuntimeError("Configure homepicz_appscript_url")
-    if window.start == window.end:
-        query = urllib.parse.urlencode({"data": window.start.isoformat()})
-    else:
-        query = urllib.parse.urlencode({"inicio": window.start.isoformat(), "fim": window.end.isoformat()})
+
+    params = (
+        {"data": window.start.isoformat(), "detalhes": "1"}
+        if window.start == window.end
+        else {"inicio": window.start.isoformat(), "fim": window.end.isoformat(), "detalhes": "1"}
+    )
     separator = "&" if "?" in settings.homepicz_appscript_url else "?"
-    url = f"{settings.homepicz_appscript_url}{separator}{query}"
+    url = f"{settings.homepicz_appscript_url}{separator}{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": "LRAutomatic/session-agent"},
@@ -38,10 +43,10 @@ def _fetch_ids_with_retry(settings: Settings, window: homepicz_scheduler.ImportW
         try:
             with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SECONDS) as response:
                 payload = json.loads(response.read().decode("utf-8-sig"))
-            ids = payload.get("ids") if isinstance(payload, dict) else None
-            if not isinstance(ids, list):
-                raise RuntimeError("Apps Script respondeu sem o campo ids")
-            return list(dict.fromkeys(str(value).strip() for value in ids if str(value).strip()))
+            items = homepicz_scheduler._parse_work_items(payload)
+            if not items:
+                raise RuntimeError("Apps Script respondeu sem trabalhos válidos")
+            return items
         except (TimeoutError, socket.timeout, urllib.error.URLError, ConnectionError, OSError) as exc:
             last_error = exc
             if attempt + 1 < FETCH_ATTEMPTS:
@@ -50,12 +55,12 @@ def _fetch_ids_with_retry(settings: Settings, window: homepicz_scheduler.ImportW
             break
 
     raise RuntimeError(
-        f"Apps Script indisponível após {FETCH_ATTEMPTS} tentativas; o ciclo será repetido automaticamente: {last_error}"
+        f"Apps Script indisponível após {FETCH_ATTEMPTS} tentativas; "
+        f"o ciclo será repetido automaticamente: {last_error}"
     )
 
 
-# run_cycle consulta este símbolo no módulo homepicz_scheduler em tempo de execução.
-homepicz_scheduler._fetch_ids = _fetch_ids_with_retry
+homepicz_scheduler._fetch_work_items = _fetch_work_items_with_retry
 
 
 def main() -> None:
