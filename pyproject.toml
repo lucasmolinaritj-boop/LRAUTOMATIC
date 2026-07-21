@@ -20,7 +20,7 @@ dependencies = [
 
 [project.scripts]
 lrautomatic = "lrautomatic.cli:app"
-lrautomatic-desktop = "lrautomatic.desktop_selective_cleanup:main"
+lrautomatic-desktop = "lrautomatic.desktop_stable:main"
 lrautomatic-session-agent = "lrautomatic.session_agent:main"
 lrautomatic-service = "lrautomatic.windows_service:main"
 
