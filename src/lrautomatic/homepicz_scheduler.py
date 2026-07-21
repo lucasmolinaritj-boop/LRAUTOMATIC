@@ -4,11 +4,13 @@ import json
 import logging
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from .catalogs import create_catalog
 from .config import Settings, load_settings
@@ -30,6 +32,14 @@ class ImportWindow:
         if self.start == self.end:
             return self.start.strftime("%d-%m-%Y")
         return f"{self.start:%d-%m-%Y}_a_{self.end:%d-%m-%Y}"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkItem:
+    work_id: str
+    photographer: str = "Sem fotógrafo"
+    service_name: str = "Serviço não informado"
+    scheduled_at: str | None = None
 
 
 def operational_today(settings: Settings, now: datetime | None = None) -> date:
@@ -57,19 +67,147 @@ def current_import_window(settings: Settings, now: datetime | None = None) -> Im
     return previous_business_window(operational_today(settings, now))
 
 
-def _fetch_ids(settings: Settings, window: ImportWindow) -> list[str]:
+def _normalized_key(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return "".join(char.lower() for char in text if char.isalnum())
+
+
+def _normalized_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {_normalized_key(key): value for key, value in record.items()}
+
+
+def _first_value(record: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = record.get(_normalized_key(key))
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _clean_name(value: object, fallback: str) -> str:
+    text = " ".join(str(value or "").replace("\n", " ").split()).strip(" -")
+    return text or fallback
+
+
+def _format_scheduled_at(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "Sem data e hora"
+
+    normalized = raw.replace("Z", "+00:00")
+    for candidate in (normalized, normalized.replace("/", "-")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            return parsed.strftime("%d-%m-%Y %Hh%M")
+        except ValueError:
+            pass
+
+    formats = (
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y",
+        "%Y-%m-%d",
+    )
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            if "%H" in fmt:
+                return parsed.strftime("%d-%m-%Y %Hh%M")
+            return parsed.strftime("%d-%m-%Y")
+        except ValueError:
+            continue
+    return _clean_name(raw, "Sem data e hora")
+
+
+def _collection_name(item: WorkItem) -> str:
+    return " - ".join(
+        (
+            _clean_name(item.work_id, "Sem ID"),
+            _format_scheduled_at(item.scheduled_at),
+            _clean_name(item.service_name, "Serviço não informado"),
+        )
+    )
+
+
+def _payload_records(payload: object) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("items", "trabalhos", "jobs", "records", "dados", "fotografias"):
+        value = payload.get(key)
+        if isinstance(value, list) and any(isinstance(item, dict) for item in value):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _parse_work_items(payload: object) -> list[WorkItem]:
+    records = _payload_records(payload)
+    items: list[WorkItem] = []
+
+    for raw_record in records:
+        record = _normalized_record(raw_record)
+        work_id = _first_value(record, "id", "id trabalho", "id agenda", "codigo")
+        if work_id is None:
+            continue
+        items.append(
+            WorkItem(
+                work_id=str(work_id).strip(),
+                photographer=_clean_name(
+                    _first_value(record, "fotografo", "fotógrafo", "photographer", "responsavel"),
+                    "Sem fotógrafo",
+                ),
+                service_name=_clean_name(
+                    _first_value(record, "servico", "serviço", "service", "tipo servico"),
+                    "Serviço não informado",
+                ),
+                scheduled_at=str(
+                    _first_value(
+                        record,
+                        "data hora",
+                        "data/hora",
+                        "data_hora",
+                        "datetime",
+                        "date time",
+                        "horario",
+                        "data",
+                    )
+                    or ""
+                ).strip()
+                or None,
+            )
+        )
+
+    if not items and isinstance(payload, dict):
+        ids = payload.get("ids")
+        if isinstance(ids, list):
+            items = [WorkItem(work_id=str(value).strip()) for value in ids if str(value).strip()]
+
+    unique: dict[str, WorkItem] = {}
+    for item in items:
+        unique[item.work_id] = item
+    return list(unique.values())
+
+
+def _fetch_work_items(settings: Settings, window: ImportWindow) -> list[WorkItem]:
     if not settings.homepicz_appscript_url:
         raise RuntimeError("Configure homepicz_appscript_url")
-    if window.start == window.end:
-        query = urllib.parse.urlencode({"data": window.start.isoformat()})
-    else:
-        query = urllib.parse.urlencode({"inicio": window.start.isoformat(), "fim": window.end.isoformat()})
-    with urllib.request.urlopen(f"{settings.homepicz_appscript_url}?{query}", timeout=60) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    ids = payload.get("ids") if isinstance(payload, dict) else None
-    if not isinstance(ids, list):
-        raise RuntimeError("Apps Script respondeu sem o campo ids")
-    return list(dict.fromkeys(str(value).strip() for value in ids if str(value).strip()))
+    params = (
+        {"data": window.start.isoformat(), "detalhes": "1"}
+        if window.start == window.end
+        else {"inicio": window.start.isoformat(), "fim": window.end.isoformat(), "detalhes": "1"}
+    )
+    separator = "&" if "?" in settings.homepicz_appscript_url else "?"
+    url = f"{settings.homepicz_appscript_url}{separator}{urllib.parse.urlencode(params)}"
+    with urllib.request.urlopen(url, timeout=60) as response:
+        payload = json.loads(response.read().decode("utf-8-sig"))
+    items = _parse_work_items(payload)
+    if not items:
+        raise RuntimeError("Apps Script respondeu sem trabalhos válidos")
+    return items
 
 
 def _catalog_for_window(settings: Settings, window: ImportWindow) -> Path:
@@ -84,11 +222,9 @@ def _catalog_for_window(settings: Settings, window: ImportWindow) -> Path:
 
 
 def _write_state(settings: Settings, payload: dict[str, object]) -> None:
-    payload = dict(payload)
-    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    settings.scheduler_state_file.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    data = dict(payload)
+    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    settings.scheduler_state_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _is_homepicz_job(job: ImportJob) -> bool:
@@ -105,9 +241,7 @@ def _count_source_files(folder: Path, recursive: bool, allowed_extensions: set[s
     try:
         for path in iterator:
             try:
-                if not path.is_file():
-                    continue
-                if path.suffix.lower().lstrip(".") not in allowed_extensions:
+                if not path.is_file() or path.suffix.lower().lstrip(".") not in allowed_extensions:
                     continue
                 if path.stat().st_size <= 0:
                     continue
@@ -125,24 +259,20 @@ def _covered_counts(jobs: list[ImportJob], collection_set: str) -> dict[str, int
         if not _is_homepicz_job(job) or job.request.collection_set != collection_set:
             continue
         status = str(job.status)
-        active = status in {"queued", "running"}
-        terminal = status in {"completed", "partial"}
-        if not active and not terminal:
+        if status not in {"queued", "running", "completed", "partial"}:
             continue
-
         progress_by_path = {_normalize_path(item.path): item for item in job.progress}
         for source in job.request.sources:
             key = _normalize_path(source.path)
             progress = progress_by_path.get(key)
-            source_completed = active or (
-                terminal and progress is not None and str(progress.status) == "completed"
+            source_completed = status in {"queued", "running"} or (
+                status in {"completed", "partial"}
+                and progress is not None
+                and str(progress.status) == "completed"
             )
             if not source_completed:
                 continue
-            known = max(
-                int(source.expected_count or 0),
-                int(progress.discovered if progress is not None else 0),
-            )
+            known = max(int(source.expected_count or 0), int(progress.discovered if progress else 0))
             covered[key] = max(covered.get(key, 0), known)
     return covered
 
@@ -189,9 +319,7 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
     }
 
     running_jobs = [job for job in jobs if str(job.status) == "running"]
-    running_other_period = [
-        job for job in running_jobs if job.request.collection_set != collection_set
-    ]
+    running_other_period = [job for job in running_jobs if job.request.collection_set != collection_set]
     if running_other_period:
         result = {
             **base_result,
@@ -204,7 +332,7 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
 
     cancelled_job_ids = _cancel_obsolete_queued_jobs(store, jobs, collection_set)
     catalog_path = _catalog_for_window(settings, window)
-    ids = _fetch_ids(settings, window)
+    items = _fetch_work_items(settings, window)
 
     allowed = {value.lower().lstrip(".") for value in settings.allowed_extensions}
     recursive = bool(settings.homepicz_recursive)
@@ -215,27 +343,28 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
     unchanged: list[str] = []
     empty: list[str] = []
 
-    for work_id in ids:
-        folder = settings.homepicz_photos_root / work_id
+    for item in items:
+        folder = settings.homepicz_photos_root / item.work_id
         if not folder.is_dir():
-            missing.append(work_id)
+            missing.append(item.work_id)
             continue
-
         expected_count = _count_source_files(folder, recursive, allowed)
         if expected_count <= 0:
-            empty.append(work_id)
+            empty.append(item.work_id)
             continue
-
         key = _normalize_path(str(folder))
         if expected_count <= covered.get(key, -1):
-            unchanged.append(work_id)
+            unchanged.append(item.work_id)
             continue
-
         sources.append(
             ImportSource(
                 path=str(folder),
-                collection=work_id,
+                collection=_collection_name(item),
                 expected_count=expected_count,
+                work_id=item.work_id,
+                photographer=_clean_name(item.photographer, "Sem fotógrafo"),
+                service_name=_clean_name(item.service_name, "Serviço não informado"),
+                scheduled_at=item.scheduled_at,
             )
         )
 
@@ -244,16 +373,13 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         **base_result,
         "status": "up_to_date",
         "catalog_path": str(catalog_path),
-        "ids": len(ids),
+        "ids": len(items),
         "new_or_expanded_sources": len(sources),
         "known_unchanged_sources": len(unchanged),
         "expected_photos": total_photos,
         "missing_ids": missing,
         "empty_ids": empty,
-        "allowed_extensions": settings.allowed_extensions,
-        "standard_previews": settings.homepicz_standard_previews,
-        "standard_preview_size": settings.homepicz_standard_preview_size,
-        "smart_previews": settings.homepicz_smart_previews,
+        "collection_structure": "Fotógrafo > ID - data e hora - serviço",
         "cancelled_obsolete_job_ids": cancelled_job_ids,
     }
 
@@ -262,6 +388,8 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
             sources=sources,
             collection_set=collection_set,
             recursive=recursive,
+            create_collections=False,
+            organize_collections_by_photographer=True,
             build_standard_previews=settings.homepicz_standard_previews,
             standard_preview_size=settings.homepicz_standard_preview_size,
             build_smart_previews=settings.homepicz_smart_previews,
@@ -270,23 +398,24 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
             duplicate_policy="skip",
         )
         job = store.create(request)
-        result["job_id"] = job.job_id
-        result["status"] = "job_created"
-        result["queue_mode"] = "incremental"
-        result["running_job_count"] = len(running_jobs)
+        result.update(
+            job_id=job.job_id,
+            status="job_created",
+            queue_mode="incremental",
+            running_job_count=len(running_jobs),
+        )
         log.info(
-            "Job incremental criado: job=%s período=%s fontes=%s fotos=%s em_execução=%s",
+            "Job incremental organizado criado: job=%s fontes=%s fotos=%s fotógrafos=%s",
             job.job_id,
-            collection_set,
             len(sources),
             total_photos,
-            len(running_jobs),
+            len({source.photographer for source in sources}),
         )
     else:
         log.info(
             "Nenhum trabalho novo: período=%s ids=%s inalterados=%s vazios=%s ausentes=%s",
             collection_set,
-            len(ids),
+            len(items),
             len(unchanged),
             len(empty),
             len(missing),
@@ -330,11 +459,7 @@ class HomePiczScheduler:
         self.settings = new_settings
         self.store = new_store
         self.config_mtime_ns = current_mtime
-        log.info(
-            "Configuração recarregada automaticamente; intervalo %s -> %s minuto(s)",
-            old_interval,
-            new_settings.homepicz_interval_minutes,
-        )
+        log.info("Configuração recarregada; intervalo %s -> %s minuto(s)", old_interval, new_settings.homepicz_interval_minutes)
         return True
 
     def start(self) -> None:
@@ -344,10 +469,7 @@ class HomePiczScheduler:
         self.first_cycle_done.clear()
         self.thread = threading.Thread(target=self._loop, name="HomePiczScheduler", daemon=True)
         self.thread.start()
-        log.info(
-            "Scheduler Home Picz iniciado; fila incremental; virada operacional às %s",
-            self.settings.homepicz_day_rollover_time,
-        )
+        log.info("Scheduler Home Picz iniciado; fila incremental e coleções por fotógrafo")
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -358,8 +480,7 @@ class HomePiczScheduler:
         while not self.stop_event.is_set():
             self._reload_settings_if_changed()
             interval_seconds = max(60, self.settings.homepicz_interval_minutes * 60)
-            elapsed = time.monotonic() - cycle_finished_at
-            remaining = interval_seconds - elapsed
+            remaining = interval_seconds - (time.monotonic() - cycle_finished_at)
             if remaining <= 0:
                 return
             self.stop_event.wait(min(CONFIG_POLL_SECONDS, remaining))
@@ -370,7 +491,6 @@ class HomePiczScheduler:
             self._reload_settings_if_changed()
             started_at = datetime.now().isoformat(timespec="seconds")
             try:
-                log.info("Iniciando ciclo Home Picz%s", " imediato" if first_cycle else "")
                 result = run_cycle(self.settings, self.store)
                 log.info("Ciclo Home Picz concluído: %s", result)
             except Exception as exc:
@@ -388,9 +508,5 @@ class HomePiczScheduler:
                 if first_cycle:
                     self.first_cycle_done.set()
                     first_cycle = False
-
             cycle_finished_at = time.monotonic()
-            interval_seconds = max(60, self.settings.homepicz_interval_minutes * 60)
-            next_run = datetime.now() + timedelta(seconds=interval_seconds)
-            log.info("Próxima verificação Home Picz em %s", next_run.isoformat(timespec="seconds"))
             self._wait_until_next_cycle(cycle_finished_at)
