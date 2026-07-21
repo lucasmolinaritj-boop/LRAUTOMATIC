@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import unicodedata
@@ -20,6 +21,7 @@ from .store import JobStore
 log = logging.getLogger("lrautomatic.homepicz")
 CONFIG_POLL_SECONDS = 1.0
 HOME_PICZ_COLLECTION_PREFIX = "Home Picz - "
+COLLECTION_ORGANIZATION_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,8 +40,17 @@ class ImportWindow:
 class WorkItem:
     work_id: str
     photographer: str = "Sem fotógrafo"
+    client: str | None = None
     service_name: str = "Serviço não informado"
     scheduled_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FolderScan:
+    status: str
+    count: int = 0
+    error: str | None = None
+    skipped_errors: int = 0
 
 
 def operational_today(settings: Settings, now: datetime | None = None) -> date:
@@ -88,6 +99,11 @@ def _first_value(record: dict[str, Any], *keys: str) -> Any:
 def _clean_name(value: object, fallback: str) -> str:
     text = " ".join(str(value or "").replace("\n", " ").split()).strip(" -")
     return text or fallback
+
+
+def _optional_name(value: object) -> str | None:
+    text = " ".join(str(value or "").replace("\n", " ").split()).strip(" -")
+    return text or None
 
 
 def _format_scheduled_at(value: object) -> str:
@@ -159,6 +175,16 @@ def _parse_work_items(payload: object) -> list[WorkItem]:
                 photographer=_clean_name(
                     _first_value(record, "fotografo", "fotógrafo", "photographer", "responsavel"),
                     "Sem fotógrafo",
+                ),
+                client=_optional_name(
+                    _first_value(
+                        record,
+                        "cliente",
+                        "nome cliente",
+                        "nome do cliente",
+                        "client",
+                        "customer",
+                    )
                 ),
                 service_name=_clean_name(
                     _first_value(record, "servico", "serviço", "service", "tipo servico"),
@@ -232,25 +258,90 @@ def _is_homepicz_job(job: ImportJob) -> bool:
 
 
 def _normalize_path(value: str) -> str:
-    return str(Path(value).expanduser().resolve()).casefold()
+    return os.path.normcase(os.path.abspath(os.path.expanduser(value)))
 
 
-def _count_source_files(folder: Path, recursive: bool, allowed_extensions: set[str]) -> int:
-    iterator = folder.rglob("*") if recursive else folder.iterdir()
-    count = 0
+def _probe_root(root: Path) -> tuple[bool, str | None]:
     try:
-        for path in iterator:
+        if not root.exists():
+            return False, f"Raiz de fotos não encontrada: {root}"
+        if not root.is_dir():
+            return False, f"Raiz de fotos não é uma pasta: {root}"
+        with os.scandir(root) as iterator:
+            next(iterator, None)
+        return True, None
+    except PermissionError as exc:
+        return False, f"Acesso negado à raiz de fotos: {exc}"
+    except OSError as exc:
+        return False, f"Drive/raiz indisponível: {type(exc).__name__}: {exc}"
+
+
+def _scan_source_folder(folder: Path, recursive: bool, allowed_extensions: set[str]) -> FolderScan:
+    try:
+        if not folder.exists():
+            return FolderScan("missing")
+        if not folder.is_dir():
+            return FolderScan("missing", error="O caminho existe, mas não é uma pasta.")
+    except PermissionError as exc:
+        return FolderScan("access_error", error=str(exc))
+    except OSError as exc:
+        return FolderScan("drive_error", error=f"{type(exc).__name__}: {exc}")
+
+    count = 0
+    skipped_errors = 0
+
+    def visit(current: Path) -> None:
+        nonlocal count, skipped_errors
+        try:
+            with os.scandir(current) as iterator:
+                entries = list(iterator)
+        except PermissionError:
+            skipped_errors += 1
+            return
+        except OSError as exc:
+            raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+
+        for entry in entries:
             try:
-                if not path.is_file() or path.suffix.lower().lstrip(".") not in allowed_extensions:
+                if entry.is_dir(follow_symlinks=False):
+                    if recursive:
+                        visit(Path(entry.path))
                     continue
-                if path.stat().st_size <= 0:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                suffix = Path(entry.name).suffix.lower().lstrip(".")
+                if suffix not in allowed_extensions:
+                    continue
+                if entry.stat(follow_symlinks=False).st_size <= 0:
                     continue
                 count += 1
-            except (OSError, PermissionError):
-                continue
-    except (OSError, PermissionError):
-        return 0
-    return count
+            except PermissionError:
+                skipped_errors += 1
+            except OSError:
+                skipped_errors += 1
+
+    try:
+        visit(folder)
+    except RuntimeError as exc:
+        return FolderScan("drive_error", count=count, error=str(exc), skipped_errors=skipped_errors)
+
+    if count == 0 and skipped_errors > 0:
+        return FolderScan(
+            "access_error",
+            count=0,
+            error=f"{skipped_errors} item(ns) não puderam ser lidos.",
+            skipped_errors=skipped_errors,
+        )
+    if count == 0:
+        return FolderScan("empty")
+    if skipped_errors > 0:
+        return FolderScan(
+            "partial",
+            count=count,
+            error=f"{skipped_errors} item(ns) foram ignorados por erro de leitura.",
+            skipped_errors=skipped_errors,
+        )
+    return FolderScan("ok", count=count)
 
 
 def _covered_counts(jobs: list[ImportJob], collection_set: str) -> dict[str, int]:
@@ -301,6 +392,62 @@ def _cancel_obsolete_queued_jobs(
     return cancelled
 
 
+def _refresh_existing_job_metadata(
+    store: JobStore,
+    jobs: list[ImportJob],
+    collection_set: str,
+    items: list[WorkItem],
+) -> list[str]:
+    by_id = {item.work_id: item for item in items}
+    updated_jobs: list[str] = []
+
+    for job in jobs:
+        if not _is_homepicz_job(job) or job.request.collection_set != collection_set:
+            continue
+        changed = False
+        for source in job.request.sources:
+            work_id = str(source.work_id or Path(source.path).name)
+            item = by_id.get(work_id)
+            if item is None:
+                continue
+            desired = {
+                "work_id": item.work_id,
+                "photographer": _clean_name(item.photographer, "Sem fotógrafo"),
+                "client": _optional_name(item.client),
+                "service_name": _clean_name(item.service_name, "Serviço não informado"),
+                "scheduled_at": item.scheduled_at,
+                "collection": _collection_name(item),
+            }
+            for field, value in desired.items():
+                if getattr(source, field, None) != value:
+                    setattr(source, field, value)
+                    changed = True
+
+        desired_flags = (
+            bool(job.request.organize_collections_by_photographer),
+            bool(job.request.organize_collections_by_client),
+            int(job.request.collection_organization_version or 0),
+        )
+        if desired_flags != (True, True, COLLECTION_ORGANIZATION_VERSION):
+            job.request.organize_collections_by_photographer = True
+            job.request.organize_collections_by_client = True
+            job.request.collection_organization_version = COLLECTION_ORGANIZATION_VERSION
+            changed = True
+
+        if changed:
+            job.collections_status = "requested"
+            job.collections_organization_version = 0
+            job.add_event(
+                "collections_reconcile",
+                "Reorganização de coleções solicitada",
+                "Metadados atualizados pelo Apps Script; as fotos já importadas serão reorganizadas sem nova importação.",
+            )
+            store.save(job)
+            updated_jobs.append(job.job_id)
+
+    return updated_jobs
+
+
 def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) -> dict[str, object]:
     current = now or datetime.now()
     effective_today = operational_today(settings, current)
@@ -333,29 +480,68 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
     cancelled_job_ids = _cancel_obsolete_queued_jobs(store, jobs, collection_set)
     catalog_path = _catalog_for_window(settings, window)
     items = _fetch_work_items(settings, window)
+    metadata_updated_jobs = _refresh_existing_job_metadata(store, jobs, collection_set, items)
 
     allowed = {value.lower().lstrip(".") for value in settings.allowed_extensions}
     recursive = bool(settings.homepicz_recursive)
-    covered = _covered_counts(jobs, collection_set)
+    covered = _covered_counts(store.list(), collection_set)
+
+    root_ok, root_error = _probe_root(settings.homepicz_photos_root)
+    if not root_ok:
+        result = {
+            **base_result,
+            "status": "drive_unavailable",
+            "alert_level": "error",
+            "alert_title": "Google Drive indisponível",
+            "alert_message": root_error,
+            "catalog_path": str(catalog_path),
+            "metadata_updated_job_ids": metadata_updated_jobs,
+            "cancelled_obsolete_job_ids": cancelled_job_ids,
+        }
+        _write_state(settings, result)
+        log.error("Ciclo interrompido por Drive indisponível: %s", root_error)
+        return result
 
     sources: list[ImportSource] = []
     missing: list[str] = []
     unchanged: list[str] = []
     empty: list[str] = []
+    drive_errors: list[dict[str, str]] = []
+    access_errors: list[dict[str, str]] = []
+    partial_reads: list[dict[str, object]] = []
 
     for item in items:
         folder = settings.homepicz_photos_root / item.work_id
-        if not folder.is_dir():
+        scan = _scan_source_folder(folder, recursive, allowed)
+
+        if scan.status == "missing":
             missing.append(item.work_id)
             continue
-        expected_count = _count_source_files(folder, recursive, allowed)
-        if expected_count <= 0:
+        if scan.status == "empty":
             empty.append(item.work_id)
             continue
+        if scan.status == "drive_error":
+            drive_errors.append({"id": item.work_id, "path": str(folder), "error": scan.error or "Erro desconhecido"})
+            continue
+        if scan.status == "access_error":
+            access_errors.append({"id": item.work_id, "path": str(folder), "error": scan.error or "Acesso negado"})
+            continue
+        if scan.status == "partial":
+            partial_reads.append(
+                {
+                    "id": item.work_id,
+                    "path": str(folder),
+                    "count": scan.count,
+                    "warning": scan.error or "Leitura parcial",
+                }
+            )
+
+        expected_count = scan.count
         key = _normalize_path(str(folder))
         if expected_count <= covered.get(key, -1):
             unchanged.append(item.work_id)
             continue
+
         sources.append(
             ImportSource(
                 path=str(folder),
@@ -363,12 +549,29 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
                 expected_count=expected_count,
                 work_id=item.work_id,
                 photographer=_clean_name(item.photographer, "Sem fotógrafo"),
+                client=_optional_name(item.client),
                 service_name=_clean_name(item.service_name, "Serviço não informado"),
                 scheduled_at=item.scheduled_at,
             )
         )
 
     total_photos = sum(source.expected_count for source in sources)
+    alert_level = "warning" if drive_errors or access_errors or partial_reads else "info"
+    alert_title = None
+    alert_message = None
+    if drive_errors:
+        alert_title = "Falha de leitura no Google Drive"
+        alert_message = f"{len(drive_errors)} pasta(s) não puderam ser lidas. Elas não foram tratadas como ausentes."
+    elif access_errors:
+        alert_title = "Acesso negado a pastas"
+        alert_message = f"{len(access_errors)} pasta(s) existem, mas não puderam ser acessadas."
+    elif partial_reads:
+        alert_title = "Leitura parcial de pastas"
+        alert_message = f"{len(partial_reads)} pasta(s) tiveram arquivos ignorados por falha de leitura."
+    elif missing:
+        alert_title = "Pastas realmente ausentes"
+        alert_message = f"{len(missing)} ID(s) não possuem pasta na raiz acessível."
+
     result: dict[str, object] = {
         **base_result,
         "status": "up_to_date",
@@ -379,7 +582,17 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         "expected_photos": total_photos,
         "missing_ids": missing,
         "empty_ids": empty,
-        "collection_structure": "Fotógrafo > ID - data e hora - serviço",
+        "drive_read_errors": drive_errors,
+        "access_errors": access_errors,
+        "partial_reads": partial_reads,
+        "metadata_updated_job_ids": metadata_updated_jobs,
+        "collection_structure": [
+            "Fotógrafo > ID - data e hora - serviço",
+            "Cliente > ID (somente quando cliente for informado)",
+        ],
+        "alert_level": alert_level,
+        "alert_title": alert_title,
+        "alert_message": alert_message,
         "cancelled_obsolete_job_ids": cancelled_job_ids,
     }
 
@@ -390,6 +603,8 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
             recursive=recursive,
             create_collections=False,
             organize_collections_by_photographer=True,
+            organize_collections_by_client=True,
+            collection_organization_version=COLLECTION_ORGANIZATION_VERSION,
             build_standard_previews=settings.homepicz_standard_previews,
             standard_preview_size=settings.homepicz_standard_preview_size,
             build_smart_previews=settings.homepicz_smart_previews,
@@ -398,6 +613,8 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
             duplicate_policy="skip",
         )
         job = store.create(request)
+        job.collections_status = "requested"
+        store.save(job)
         result.update(
             job_id=job.job_id,
             status="job_created",
@@ -405,20 +622,23 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
             running_job_count=len(running_jobs),
         )
         log.info(
-            "Job incremental organizado criado: job=%s fontes=%s fotos=%s fotógrafos=%s",
+            "Job incremental criado: job=%s fontes=%s fotos=%s fotógrafos=%s clientes=%s",
             job.job_id,
             len(sources),
             total_photos,
             len({source.photographer for source in sources}),
+            len({source.client for source in sources if source.client}),
         )
     else:
         log.info(
-            "Nenhum trabalho novo: período=%s ids=%s inalterados=%s vazios=%s ausentes=%s",
+            "Nenhum trabalho novo: período=%s ids=%s inalterados=%s vazios=%s ausentes=%s drive=%s acesso=%s",
             collection_set,
             len(items),
             len(unchanged),
             len(empty),
             len(missing),
+            len(drive_errors),
+            len(access_errors),
         )
 
     _write_state(settings, result)
@@ -469,7 +689,7 @@ class HomePiczScheduler:
         self.first_cycle_done.clear()
         self.thread = threading.Thread(target=self._loop, name="HomePiczScheduler", daemon=True)
         self.thread.start()
-        log.info("Scheduler Home Picz iniciado; fila incremental e coleções por fotógrafo")
+        log.info("Scheduler Home Picz iniciado; fila incremental e coleções por fotógrafo/cliente")
 
     def stop(self) -> None:
         self.stop_event.set()
