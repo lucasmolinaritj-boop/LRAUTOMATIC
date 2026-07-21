@@ -51,6 +51,7 @@ class FolderScan:
     count: int = 0
     error: str | None = None
     skipped_errors: int = 0
+    broken_raws: tuple[dict[str, str], ...] = ()
 
 
 def operational_today(settings: Settings, now: datetime | None = None) -> date:
@@ -287,59 +288,106 @@ def _scan_source_folder(folder: Path, recursive: bool, allowed_extensions: set[s
     except OSError as exc:
         return FolderScan("drive_error", error=f"{type(exc).__name__}: {exc}")
 
+    important_extensions = {value.lower().lstrip(".") for value in allowed_extensions}
     count = 0
     skipped_errors = 0
+    broken_raws: list[dict[str, str]] = []
+
+    def register_broken_raw(path: str, reason: str) -> None:
+        broken_raws.append(
+            {
+                "name": Path(path).name,
+                "path": path,
+                "error": reason,
+            }
+        )
 
     def visit(current: Path) -> None:
         nonlocal count, skipped_errors
         try:
             with os.scandir(current) as iterator:
                 entries = list(iterator)
-        except PermissionError:
+        except PermissionError as exc:
             skipped_errors += 1
+            log.warning("Acesso negado ao listar subpasta %s: %s", current, exc)
             return
         except OSError as exc:
-            raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+            skipped_errors += 1
+            log.warning(
+                "Falha ao listar subpasta %s; a pasta principal continuará sendo processada: %s: %s",
+                current,
+                type(exc).__name__,
+                exc,
+            )
+            return
 
         for entry in entries:
+            entry_path = str(entry.path)
+            suffix = Path(entry.name).suffix.lower().lstrip(".")
+
+            # Extensões irrelevantes são descartadas pelo nome, antes de qualquer
+            # consulta ao placeholder do Google Drive. Assim um vídeo quebrado não
+            # bloqueia a pasta nem gera alerta falso de RAW.
+            if suffix and suffix not in important_extensions:
+                continue
+
             try:
                 if entry.is_dir(follow_symlinks=False):
                     if recursive:
                         visit(Path(entry.path))
                     continue
+            except (PermissionError, OSError) as exc:
+                if suffix in important_extensions:
+                    register_broken_raw(entry_path, f"{type(exc).__name__}: {exc}")
+                continue
+
+            if suffix not in important_extensions:
+                continue
+
+            try:
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                suffix = Path(entry.name).suffix.lower().lstrip(".")
-                if suffix not in allowed_extensions:
-                    continue
-                if entry.stat(follow_symlinks=False).st_size <= 0:
+                size = entry.stat(follow_symlinks=False).st_size
+                if size <= 0:
+                    register_broken_raw(entry_path, "Arquivo RAW possui 0 bytes.")
                     continue
                 count += 1
-            except PermissionError:
-                skipped_errors += 1
-            except OSError:
-                skipped_errors += 1
+            except PermissionError as exc:
+                register_broken_raw(entry_path, f"Acesso negado ao RAW: {exc}")
+            except OSError as exc:
+                register_broken_raw(entry_path, f"{type(exc).__name__}: {exc}")
 
-    try:
-        visit(folder)
-    except RuntimeError as exc:
-        return FolderScan("drive_error", count=count, error=str(exc), skipped_errors=skipped_errors)
+    visit(folder)
 
+    if count == 0 and broken_raws:
+        return FolderScan(
+            "raw_error",
+            count=0,
+            error=f"{len(broken_raws)} arquivo(s) RAW não puderam ser lidos.",
+            skipped_errors=skipped_errors,
+            broken_raws=tuple(broken_raws),
+        )
     if count == 0 and skipped_errors > 0:
         return FolderScan(
             "access_error",
             count=0,
-            error=f"{skipped_errors} item(ns) não puderam ser lidos.",
+            error=f"{skipped_errors} subpasta(s) não puderam ser listadas.",
             skipped_errors=skipped_errors,
         )
     if count == 0:
         return FolderScan("empty")
-    if skipped_errors > 0:
+    if broken_raws or skipped_errors > 0:
+        messages: list[str] = []
+        if broken_raws:
+            messages.append(f"{len(broken_raws)} RAW(s) problemático(s)")
+        if skipped_errors:
+            messages.append(f"{skipped_errors} subpasta(s) não puderam ser listadas")
         return FolderScan(
             "partial",
             count=count,
-            error=f"{skipped_errors} item(ns) foram ignorados por erro de leitura.",
+            error="; ".join(messages) + ".",
             skipped_errors=skipped_errors,
+            broken_raws=tuple(broken_raws),
         )
     return FolderScan("ok", count=count)
 
@@ -509,16 +557,32 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
     drive_errors: list[dict[str, str]] = []
     access_errors: list[dict[str, str]] = []
     partial_reads: list[dict[str, object]] = []
+    broken_raw_files: list[dict[str, str]] = []
 
     for item in items:
         folder = settings.homepicz_photos_root / item.work_id
         scan = _scan_source_folder(folder, recursive, allowed)
+
+        for broken in scan.broken_raws:
+            broken_raw_files.append(
+                {
+                    "id": item.work_id,
+                    "folder": str(folder),
+                    "name": broken.get("name", ""),
+                    "path": broken.get("path", ""),
+                    "error": broken.get("error", "Erro de leitura"),
+                }
+            )
 
         if scan.status == "missing":
             missing.append(item.work_id)
             continue
         if scan.status == "empty":
             empty.append(item.work_id)
+            continue
+        if scan.status == "raw_error":
+            # A pasta existe, mas só contém RAWs problemáticos. Ela não é marcada
+            # como vazia e não bloqueia o processamento dos demais trabalhos.
             continue
         if scan.status == "drive_error":
             drive_errors.append({"id": item.work_id, "path": str(folder), "error": scan.error or "Erro desconhecido"})
@@ -556,18 +620,21 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         )
 
     total_photos = sum(source.expected_count for source in sources)
-    alert_level = "warning" if drive_errors or access_errors or partial_reads else "info"
+    alert_level = "warning" if broken_raw_files or drive_errors or access_errors else "info"
     alert_title = None
     alert_message = None
-    if drive_errors:
+    if broken_raw_files:
+        alert_title = "Arquivos RAW problemáticos"
+        alert_message = (
+            f"{len(broken_raw_files)} arquivo(s) RAW apresentaram erro. "
+            "Os demais arquivos, jobs e atualizações de mapeamento continuam normalmente."
+        )
+    elif drive_errors:
         alert_title = "Falha de leitura no Google Drive"
         alert_message = f"{len(drive_errors)} pasta(s) não puderam ser lidas. Elas não foram tratadas como ausentes."
     elif access_errors:
         alert_title = "Acesso negado a pastas"
         alert_message = f"{len(access_errors)} pasta(s) existem, mas não puderam ser acessadas."
-    elif partial_reads:
-        alert_title = "Leitura parcial de pastas"
-        alert_message = f"{len(partial_reads)} pasta(s) tiveram arquivos ignorados por falha de leitura."
     elif missing:
         alert_title = "Pastas realmente ausentes"
         alert_message = f"{len(missing)} ID(s) não possuem pasta na raiz acessível."
@@ -585,6 +652,8 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
         "drive_read_errors": drive_errors,
         "access_errors": access_errors,
         "partial_reads": partial_reads,
+        "broken_raw_files": broken_raw_files,
+        "broken_raw_count": len(broken_raw_files),
         "metadata_updated_job_ids": metadata_updated_jobs,
         "collection_structure": [
             "Fotógrafo > ID - data e hora - serviço",
@@ -622,16 +691,17 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
             running_job_count=len(running_jobs),
         )
         log.info(
-            "Job incremental criado: job=%s fontes=%s fotos=%s fotógrafos=%s clientes=%s",
+            "Job incremental criado: job=%s fontes=%s fotos=%s fotógrafos=%s clientes=%s RAWs_problemáticos=%s",
             job.job_id,
             len(sources),
             total_photos,
             len({source.photographer for source in sources}),
             len({source.client for source in sources if source.client}),
+            len(broken_raw_files),
         )
     else:
         log.info(
-            "Nenhum trabalho novo: período=%s ids=%s inalterados=%s vazios=%s ausentes=%s drive=%s acesso=%s",
+            "Nenhum trabalho novo: período=%s ids=%s inalterados=%s vazios=%s ausentes=%s drive=%s acesso=%s RAWs_problemáticos=%s",
             collection_set,
             len(items),
             len(unchanged),
@@ -639,6 +709,7 @@ def run_cycle(settings: Settings, store: JobStore, now: datetime | None = None) 
             len(missing),
             len(drive_errors),
             len(access_errors),
+            len(broken_raw_files),
         )
 
     _write_state(settings, result)
