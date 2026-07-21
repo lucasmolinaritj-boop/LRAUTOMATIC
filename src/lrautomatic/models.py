@@ -57,6 +57,10 @@ class ImportSource(BaseModel):
     recursive: bool | None = None
     keywords: list[str] = Field(default_factory=list)
     expected_count: int = Field(default=0, ge=0)
+    work_id: str | None = None
+    photographer: str | None = None
+    service_name: str | None = None
+    scheduled_at: str | None = None
 
     @field_validator('path')
     @classmethod
@@ -72,6 +76,7 @@ class ImportJobRequest(BaseModel):
     collection_set: str | None = None
     recursive: bool = False
     create_collections: bool = True
+    organize_collections_by_photographer: bool = False
     build_standard_previews: bool = True
     standard_preview_size: int = Field(default=2048, ge=256, le=16384)
     build_smart_previews: bool = False
@@ -106,7 +111,7 @@ class JobEvent(BaseModel):
 
 
 class ImportJob(BaseModel):
-    schema_version: int = 5
+    schema_version: int = 6
     job_id: str = Field(default_factory=lambda: f'job_{uuid4().hex}')
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -133,6 +138,9 @@ class ImportJob(BaseModel):
     smart_previews_created: int = 0
     smart_previews_existed: int = 0
     smart_previews_failed: int = 0
+    collections_status: str = 'not_requested'
+    collections_created: int = 0
+    collection_sets_created: int = 0
 
     def touch(self) -> None:
         self.updated_at = utc_now()
