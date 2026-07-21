@@ -13,8 +13,9 @@ import win32con
 import win32gui
 import win32process
 
+from .automation_control import consume_force_next, read_control
 from .config import load_settings
-from .homepicz_scheduler import HomePiczScheduler
+from .homepicz_scheduler import HomePiczScheduler, run_cycle
 from .store import JobStore
 
 log = logging.getLogger("lrautomatic.session_agent")
@@ -148,6 +149,13 @@ def ensure_correct_catalog(settings) -> bool:
     return True
 
 
+def _job_states(store: JobStore) -> tuple[bool, bool]:
+    jobs = store.list()
+    running = any(str(job.status) == "running" for job in jobs)
+    queued = any(str(job.status) == "queued" for job in jobs)
+    return running, queued
+
+
 def run_forever(config_path: str | Path = "config.json") -> None:
     settings = load_settings(config_path)
     logging.basicConfig(
@@ -156,11 +164,23 @@ def run_forever(config_path: str | Path = "config.json") -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     store = JobStore(settings)
-    scheduler = HomePiczScheduler(settings, store, config_path=config_path)
-    scheduler.start()
-    _write_startup_state(settings, status="checking_homepicz_now")
+    scheduler: HomePiczScheduler | None = None
+    forced_job_active = False
+
+    def start_scheduler() -> HomePiczScheduler:
+        instance = HomePiczScheduler(settings, store, config_path=config_path)
+        instance.start()
+        return instance
+
+    control = read_control(settings)
+    if not control["paused"]:
+        scheduler = start_scheduler()
+        _write_startup_state(settings, status="checking_homepicz_now")
+    else:
+        _write_startup_state(settings, status="automation_paused")
+
     log.info(
-        "Agente iniciado: verificação Home Picz imediata; catálogo será conferido a cada %ss",
+        "Agente iniciado: controle pelo Monitor ativo; catálogo será conferido a cada %ss",
         CATALOG_POLL_SECONDS,
     )
 
@@ -168,29 +188,70 @@ def run_forever(config_path: str | Path = "config.json") -> None:
     try:
         while True:
             try:
-                opened_now = ensure_correct_catalog(settings)
-                running_now = bool(_lightroom_processes())
-                if opened_now:
+                control = read_control(settings)
+                paused = bool(control["paused"])
+                force_pending = bool(control["force_next_requested"])
+                running_job, queued_job = _job_states(store)
+
+                if paused and scheduler is not None:
+                    scheduler.stop()
+                    scheduler = None
+                    log.info("Automação pausada pelo Monitor; job em execução não foi interrompido")
                     _write_startup_state(
                         settings,
-                        status="lightroom_opened_waiting_plugin",
-                        message="O plugin deve consumir a fila automaticamente em poucos segundos.",
+                        status="automation_paused_waiting_running" if running_job else "automation_paused",
                     )
-                    log.info("Lightroom aberto; aguardando o plugin consumir a fila automaticamente")
-                elif running_now and not lightroom_seen:
-                    _write_startup_state(
+                elif not paused and scheduler is None:
+                    scheduler = start_scheduler()
+                    log.info("Automação retomada pelo Monitor")
+                    _write_startup_state(settings, status="automation_resumed")
+
+                if force_pending and not running_job:
+                    if scheduler is not None:
+                        scheduler.stop()
+                        scheduler = None
+                    result = run_cycle(settings, store)
+                    forced_job_active = True
+                    consume_force_next(
                         settings,
-                        status="lightroom_detected_waiting_plugin",
-                        message="O plugin deve consumir a fila automaticamente em poucos segundos.",
+                        message=f"Ciclo imediato executado: {result.get('status', 'concluído')}.",
                     )
-                    log.info("Lightroom detectado; o plugin deve iniciar a importação em poucos segundos")
-                lightroom_seen = running_now
+                    log.info("Próximo job forçado pelo Monitor: %s", result)
+                    _write_startup_state(settings, status="forced_cycle_completed", result=result)
+                    if not paused:
+                        scheduler = start_scheduler()
+                    running_job, queued_job = _job_states(store)
+
+                may_manage_catalog = (not paused) or running_job or forced_job_active
+                if may_manage_catalog:
+                    opened_now = ensure_correct_catalog(settings)
+                    running_now = bool(_lightroom_processes())
+                    if opened_now:
+                        _write_startup_state(
+                            settings,
+                            status="lightroom_opened_waiting_plugin",
+                            message="O plugin deve consumir a fila automaticamente em poucos segundos.",
+                        )
+                        log.info("Lightroom aberto; aguardando o plugin consumir a fila automaticamente")
+                    elif running_now and not lightroom_seen:
+                        _write_startup_state(
+                            settings,
+                            status="lightroom_detected_waiting_plugin",
+                            message="O plugin deve consumir a fila automaticamente em poucos segundos.",
+                        )
+                        log.info("Lightroom detectado; o plugin deve iniciar a importação em poucos segundos")
+                    lightroom_seen = running_now
+
+                if forced_job_active and not running_job and not queued_job:
+                    forced_job_active = False
+                    log.info("Job forçado concluído; retornando ao estado normal de controle")
             except Exception:
                 _write_startup_state(settings, status="failed", error="Consulte session-agent.log")
-                log.exception("Falha ao garantir o catálogo correto")
+                log.exception("Falha no ciclo do agente")
             time.sleep(CATALOG_POLL_SECONDS)
     finally:
-        scheduler.stop()
+        if scheduler is not None:
+            scheduler.stop()
 
 
 def main() -> None:
