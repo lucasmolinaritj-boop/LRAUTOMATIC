@@ -4,6 +4,7 @@ local LrPathUtils = import 'LrPathUtils'
 local Json = require 'Json'
 
 local Organizer = {}
+local ORGANIZATION_VERSION = 2
 
 local function homePath()
     local home = LrPathUtils.getStandardFilePath('home')
@@ -64,7 +65,17 @@ local function cleanName(value, fallback)
     text = string.gsub(text, '%s+', ' ')
     text = string.gsub(text, '^%s+', '')
     text = string.gsub(text, '%s+$', '')
+    text = string.gsub(text, '^%-+', '')
+    text = string.gsub(text, '%-+$', '')
+    text = string.gsub(text, '^%s+', '')
+    text = string.gsub(text, '%s+$', '')
     if text == '' then return fallback end
+    return text
+end
+
+local function optionalName(value)
+    local text = cleanName(value, '')
+    if text == '' then return nil end
     return text
 end
 
@@ -164,10 +175,49 @@ local function collectPhotos(catalog, source, request)
     return photos
 end
 
+local function addToTree(catalog, setName, collectionName, photos, counters)
+    local set, setWasCreated = ensureCollectionSet(catalog, setName)
+    if not set then
+        counters.failures = counters.failures + 1
+        return
+    end
+    if setWasCreated then counters.setsCreated = counters.setsCreated + 1 end
+
+    local collection, collectionWasCreated = ensureCollection(catalog, set, collectionName)
+    if not collection then
+        counters.failures = counters.failures + 1
+        return
+    end
+    if collectionWasCreated then counters.collectionsCreated = counters.collectionsCreated + 1 end
+
+    if #photos > 0 then
+        local ok = withWrite(catalog, 'LRAutomatic: organizar ' .. collectionName, function()
+            collection:addPhotos(photos)
+        end)
+        if ok then
+            counters.photosAdded = counters.photosAdded + #photos
+        else
+            counters.failures = counters.failures + 1
+        end
+    end
+end
+
+local function needsOrganization(job, request)
+    if request.organize_collections_by_photographer ~= true
+        and request.organize_collections_by_client ~= true then
+        return false
+    end
+    local requestedVersion = tonumber(request.collection_organization_version or 0) or 0
+    local completedVersion = tonumber(job.collections_organization_version or 0) or 0
+    if requestedVersion < ORGANIZATION_VERSION then requestedVersion = ORGANIZATION_VERSION end
+    if completedVersion < requestedVersion then return true end
+    return tostring(job.collections_status or '') ~= 'completed'
+end
+
 local function organizeJob(path, job)
     local request = job.request or {}
-    if request.organize_collections_by_photographer ~= true then return false end
-    if tostring(job.collections_status or '') == 'completed' then return false end
+    if not needsOrganization(job, request) then return false end
+
     local status = tostring(job.status or '')
     if status ~= 'completed' and status ~= 'partial' then return false end
 
@@ -180,44 +230,55 @@ local function organizeJob(path, job)
     job.collections_status = 'running'
     writeJson(path, job)
 
-    local setsCreated = 0
-    local collectionsCreated = 0
-    local photosAdded = 0
-    local failures = 0
+    local counters = {
+        setsCreated = 0,
+        collectionsCreated = 0,
+        photosAdded = 0,
+        failures = 0,
+        photographerTrees = 0,
+        clientTrees = 0,
+        clientSkipped = 0,
+    }
 
     for _, source in ipairs(request.sources or {}) do
-        local photographer = cleanName(source.photographer, 'Sem fotógrafo')
-        local collectionName = cleanName(source.collection, cleanName(source.work_id, 'Sem ID'))
-        local set, setWasCreated = ensureCollectionSet(catalog, photographer)
-        if set then
-            if setWasCreated then setsCreated = setsCreated + 1 end
-            local collection, collectionWasCreated = ensureCollection(catalog, set, collectionName)
-            if collection then
-                if collectionWasCreated then collectionsCreated = collectionsCreated + 1 end
-                local photos = collectPhotos(catalog, source, request)
-                if #photos > 0 then
-                    local ok = withWrite(catalog, 'LRAutomatic: organizar ' .. collectionName, function()
-                        collection:addPhotos(photos)
-                    end)
-                    if ok then photosAdded = photosAdded + #photos else failures = failures + 1 end
-                end
+        local photos = collectPhotos(catalog, source, request)
+        local workId = cleanName(source.work_id, cleanName(LrPathUtils.leafName(source.path or ''), 'Sem ID'))
+
+        if request.organize_collections_by_photographer == true then
+            local photographer = cleanName(source.photographer, 'Sem fotógrafo')
+            local photographerCollection = cleanName(source.collection, workId)
+            addToTree(catalog, photographer, photographerCollection, photos, counters)
+            counters.photographerTrees = counters.photographerTrees + 1
+        end
+
+        if request.organize_collections_by_client == true then
+            local client = optionalName(source.client)
+            if client then
+                addToTree(catalog, client, workId, photos, counters)
+                counters.clientTrees = counters.clientTrees + 1
             else
-                failures = failures + 1
+                counters.clientSkipped = counters.clientSkipped + 1
             end
-        else
-            failures = failures + 1
         end
     end
 
-    job.collection_sets_created = setsCreated
-    job.collections_created = collectionsCreated
-    job.collections_status = failures > 0 and 'partial' or 'completed'
+    job.collection_sets_created = counters.setsCreated
+    job.collections_created = counters.collectionsCreated
+    job.collections_status = counters.failures > 0 and 'partial' or 'completed'
+    job.collections_organization_version = ORGANIZATION_VERSION
     appendEvent(
         job,
         'collections',
-        failures > 0 and 'Coleções organizadas com ressalvas' or 'Coleções organizadas por fotógrafo',
-        'Conjuntos novos: ' .. setsCreated .. '; coleções novas: ' .. collectionsCreated .. '; fotos vinculadas: ' .. photosAdded .. '; falhas: ' .. failures .. '.',
-        failures > 0 and 'warning' or 'info'
+        counters.failures > 0 and 'Coleções reorganizadas com ressalvas' or 'Coleções organizadas e reconciliadas',
+        'Versão: ' .. ORGANIZATION_VERSION
+            .. '; conjuntos novos: ' .. counters.setsCreated
+            .. '; coleções novas: ' .. counters.collectionsCreated
+            .. '; vínculos de fotos: ' .. counters.photosAdded
+            .. '; árvores por fotógrafo: ' .. counters.photographerTrees
+            .. '; árvores por cliente: ' .. counters.clientTrees
+            .. '; clientes ausentes ignorados: ' .. counters.clientSkipped
+            .. '; falhas: ' .. counters.failures .. '.',
+        counters.failures > 0 and 'warning' or 'info'
     )
     writeJson(path, job)
     return true
