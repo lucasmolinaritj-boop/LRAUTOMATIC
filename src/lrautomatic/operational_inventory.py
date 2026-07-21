@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,17 @@ from .resilient_scanner import DEFAULT_EXTENSIONS, scan_folder_resilient
 RAW_EXTENSIONS = set(DEFAULT_EXTENSIONS)
 MAX_WORKERS = 4
 FOLDER_SCAN_TIMEOUT_SECONDS = 20.0
+IGNORED_FOLDER_NAMES = frozenset({"video"})
+
+
+def _normalized_folder_name(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return " ".join(text.casefold().split())
+
+
+def _is_ignored_folder_name(value: object) -> bool:
+    return _normalized_folder_name(value) in IGNORED_FOLDER_NAMES
 
 
 def normalize_raw_extensions(extensions: Iterable[str] | None) -> frozenset[str]:
@@ -71,12 +83,12 @@ class OperationalFolder:
     def warning(self) -> str:
         if not self.folder_exists:
             return "⚠ Pasta não encontrada"
-        if self.scan_timed_out:
-            return "⛔ Leitura interrompida: possível bloqueio do Drive"
+        if self.scan_timed_out and self.total == 0:
+            return "⚠ Leitura parcial: uma subpasta travou no Drive"
         if self.zero_byte_count:
             return f"⚠ {self.zero_byte_count} arquivo(s) RAW com 0 byte"
         if self.errors:
-            return "⚠ Leitura incompleta"
+            return "⚠ Leitura parcial — demais pastas preservadas"
         if self.total == 0:
             return "⚠ Sem arquivos RAW"
         return "OK"
@@ -200,10 +212,74 @@ def fetch_operational_works(settings: Settings, window: ImportWindow | None = No
 def _scan_work(root: Path, work: dict[str, str]) -> OperationalFolder:
     work_id = work["id"]
     folder = root / work_id
-    result = scan_folder_resilient(folder, RAW_EXTENSIONS, timeout_seconds=FOLDER_SCAN_TIMEOUT_SECONDS)
-    errors = list(result.errors)
-    if result.zero_byte_files:
+
+    try:
+        folder_exists = folder.is_dir()
+    except OSError:
+        folder_exists = False
+
+    if not folder_exists:
+        return OperationalFolder(
+            work_id=work_id,
+            photographer=work.get("fotografo") or "Fotógrafo não informado",
+            service=work.get("servico") or "",
+            status=work.get("status") or "",
+            scheduled_at=work.get("dataHora") or "",
+            path=str(folder),
+            folder_exists=False,
+            cr2=0,
+            cr3=0,
+            dng=0,
+            latest_mtime=None,
+        )
+
+    counts = {"cr2": 0, "cr3": 0, "dng": 0}
+    latest_mtime: float | None = None
+    zero_byte_count = 0
+    timed_out = False
+    suspect_path: str | None = None
+    errors: list[str] = []
+    scan_targets: list[Path] = []
+
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if _is_ignored_folder_name(entry.name):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        scan_targets.append(Path(entry.path))
+                        continue
+                    suffix = Path(entry.name).suffix.lower()
+                    if suffix not in RAW_EXTENSIONS:
+                        continue
+                    stat = entry.stat(follow_symlinks=False)
+                    key = suffix.lstrip(".")
+                    counts[key] += 1
+                    if stat.st_size == 0:
+                        zero_byte_count += 1
+                        errors.append(f"Arquivo RAW com 0 byte: {entry.path}")
+                    latest_mtime = stat.st_mtime if latest_mtime is None else max(latest_mtime, stat.st_mtime)
+                except OSError as exc:
+                    if Path(entry.name).suffix.lower() in RAW_EXTENSIONS:
+                        errors.append(f"{entry.path}: {exc}")
+    except OSError as exc:
+        errors.append(f"Não foi possível listar a pasta do trabalho: {folder}: {exc}")
+
+    for target in scan_targets:
+        result = scan_folder_resilient(target, RAW_EXTENSIONS, timeout_seconds=FOLDER_SCAN_TIMEOUT_SECONDS)
+        for key in counts:
+            counts[key] += int(result.counts.get(key, 0))
+        if result.latest_mtime is not None:
+            latest_mtime = result.latest_mtime if latest_mtime is None else max(latest_mtime, result.latest_mtime)
+        zero_byte_count += result.zero_byte_count
+        errors.extend(result.errors)
         errors.extend(f"Arquivo RAW com 0 byte: {path}" for path in result.zero_byte_files[:20])
+        if result.timed_out:
+            timed_out = True
+            suspect_path = result.suspect_path or str(target)
+            errors.append(f"Subpasta ignorada após travar no Google Drive: {suspect_path}")
+
     return OperationalFolder(
         work_id=work_id,
         photographer=work.get("fotografo") or "Fotógrafo não informado",
@@ -211,14 +287,14 @@ def _scan_work(root: Path, work: dict[str, str]) -> OperationalFolder:
         status=work.get("status") or "",
         scheduled_at=work.get("dataHora") or "",
         path=str(folder),
-        folder_exists=result.folder_exists,
-        cr2=int(result.counts.get("cr2", 0)),
-        cr3=int(result.counts.get("cr3", 0)),
-        dng=int(result.counts.get("dng", 0)),
-        latest_mtime=result.latest_mtime,
-        zero_byte_count=result.zero_byte_count,
-        scan_timed_out=result.timed_out,
-        suspect_path=result.suspect_path,
+        folder_exists=True,
+        cr2=counts["cr2"],
+        cr3=counts["cr3"],
+        dng=counts["dng"],
+        latest_mtime=latest_mtime,
+        zero_byte_count=zero_byte_count,
+        scan_timed_out=timed_out,
+        suspect_path=suspect_path,
         errors=tuple(errors[:50]),
     )
 
@@ -267,23 +343,31 @@ def _delete_folder_raw_files(
         candidate.relative_to(root)
     except ValueError:
         return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 1, 0, (f"Caminho recusado fora da raiz: {candidate}",))
-    if folder.scan_timed_out:
-        return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 1, 0, ("Exclusão recusada: a leitura desta pasta expirou.",))
     try:
         if not candidate.is_dir():
             return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 0, 0, ())
-        for path in candidate.rglob("*"):
-            if path.suffix.lower() not in extensions:
-                continue
-            try:
-                size = path.stat().st_size
-                path.unlink()
-                deleted += 1
-                bytes_freed += size
-            except OSError as exc:
-                failed += 1
-                if len(errors) < 50:
-                    errors.append(f"{path}: {exc}")
+
+        def on_walk_error(exc: OSError) -> None:
+            nonlocal failed
+            failed += 1
+            if len(errors) < 50:
+                errors.append(str(exc))
+
+        for current, directories, filenames in os.walk(candidate, topdown=True, onerror=on_walk_error, followlinks=False):
+            directories[:] = [name for name in directories if not _is_ignored_folder_name(name)]
+            for filename in filenames:
+                path = Path(current) / filename
+                if path.suffix.lower() not in extensions:
+                    continue
+                try:
+                    size = path.stat().st_size
+                    path.unlink()
+                    deleted += 1
+                    bytes_freed += size
+                except OSError as exc:
+                    failed += 1
+                    if len(errors) < 50:
+                        errors.append(f"{path}: {exc}")
     except OSError as exc:
         failed += 1
         errors.append(f"{candidate}: {exc}")
