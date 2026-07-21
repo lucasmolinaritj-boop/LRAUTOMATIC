@@ -203,15 +203,14 @@ local function addToTree(catalog, setName, collectionName, photos, counters)
 end
 
 local function needsOrganization(job, request)
+    if tostring(job.collections_run_once_token or '') ~= tostring(job.job_id or '') then
+        return false
+    end
     if request.organize_collections_by_photographer ~= true
         and request.organize_collections_by_client ~= true then
         return false
     end
-    local requestedVersion = tonumber(request.collection_organization_version or 0) or 0
-    local completedVersion = tonumber(job.collections_organization_version or 0) or 0
-    if requestedVersion < ORGANIZATION_VERSION then requestedVersion = ORGANIZATION_VERSION end
-    if completedVersion < requestedVersion then return true end
-    return tostring(job.collections_status or '') ~= 'completed'
+    return tostring(job.collections_status or '') == 'requested'
 end
 
 local function organizeJob(path, job)
@@ -266,12 +265,12 @@ local function organizeJob(path, job)
     job.collections_created = counters.collectionsCreated
     job.collections_status = counters.failures > 0 and 'partial' or 'completed'
     job.collections_organization_version = ORGANIZATION_VERSION
+    job.collections_run_once_token = nil
     appendEvent(
         job,
         'collections',
-        counters.failures > 0 and 'Coleções reorganizadas com ressalvas' or 'Coleções organizadas e reconciliadas',
-        'Versão: ' .. ORGANIZATION_VERSION
-            .. '; conjuntos novos: ' .. counters.setsCreated
+        counters.failures > 0 and 'Coleções organizadas com ressalvas' or 'Coleções organizadas ao concluir o job',
+        'Execução única; conjuntos novos: ' .. counters.setsCreated
             .. '; coleções novas: ' .. counters.collectionsCreated
             .. '; vínculos de fotos: ' .. counters.photosAdded
             .. '; árvores por fotógrafo: ' .. counters.photographerTrees
