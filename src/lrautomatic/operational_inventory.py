@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .config import Settings
 from .homepicz_scheduler import ImportWindow, current_import_window
@@ -78,6 +78,22 @@ class OperationalInventory:
     def missing_count(self) -> int:
         return sum(not item.folder_exists for item in self.folders)
 
+    def select(self, work_ids: Iterable[str] | None = None) -> tuple[OperationalFolder, ...]:
+        if work_ids is None:
+            return self.folders
+        wanted = {str(value).strip() for value in work_ids if str(value).strip()}
+        return tuple(item for item in self.folders if item.work_id in wanted)
+
+
+@dataclass(frozen=True, slots=True)
+class RawDeletionFolderResult:
+    work_id: str
+    photographer: str
+    deleted: int
+    failed: int
+    bytes_freed: int
+    errors: tuple[str, ...]
+
 
 @dataclass(frozen=True, slots=True)
 class RawDeletionResult:
@@ -85,6 +101,7 @@ class RawDeletionResult:
     failed: int
     bytes_freed: int
     errors: tuple[str, ...]
+    folders: tuple[RawDeletionFolderResult, ...] = ()
 
 
 def _query_for_window(window: ImportWindow) -> str:
@@ -135,7 +152,6 @@ def fetch_operational_works(settings: Settings, window: ImportWindow | None = No
             if str(value).strip()
         ]
 
-    # A última ocorrência do mesmo ID vence, igual ao WebApp.
     unique = {item["id"]: item for item in works}
     return target_window, list(unique.values())
 
@@ -211,7 +227,6 @@ def scan_operational_inventory(settings: Settings, now: datetime | None = None) 
                 folders.append(item)
                 errors.extend(item.errors)
 
-    # Ordem operacional: horário da agenda e, depois, ID numérico/textual.
     folders.sort(key=lambda item: (item.scheduled_at, item.work_id.lower()))
     return OperationalInventory(
         root=str(root),
@@ -222,44 +237,75 @@ def scan_operational_inventory(settings: Settings, now: datetime | None = None) 
     )
 
 
-def delete_snapshot_raw_files(snapshot: OperationalInventory) -> RawDeletionResult:
-    """Exclui somente CR2/CR3/DNG das pastas presentes no snapshot confirmado.
-
-    Cada caminho é validado novamente para impedir que uma resposta alterada da API
-    faça a limpeza escapar da raiz que foi analisada.
-    """
-    root = Path(snapshot.root).resolve()
+def _delete_folder_raw_files(root: Path, folder: OperationalFolder) -> RawDeletionFolderResult:
+    candidate = Path(folder.path).resolve()
     deleted = failed = bytes_freed = 0
     errors: list[str] = []
 
-    for folder in snapshot.folders:
-        candidate = Path(folder.path).resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError:
-            failed += 1
-            errors.append(f"Caminho recusado fora da raiz: {candidate}")
-            continue
-        if not candidate.is_dir():
-            continue
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return RawDeletionFolderResult(
+            work_id=folder.work_id,
+            photographer=folder.photographer,
+            deleted=0,
+            failed=1,
+            bytes_freed=0,
+            errors=(f"Caminho recusado fora da raiz: {candidate}",),
+        )
 
+    if not candidate.is_dir():
+        return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 0, 0, ())
+
+    try:
+        paths = list(candidate.rglob("*"))
+    except OSError as exc:
+        return RawDeletionFolderResult(folder.work_id, folder.photographer, 0, 1, 0, (f"{candidate}: {exc}",))
+
+    for path in paths:
+        if path.suffix.lower() not in RAW_EXTENSIONS:
+            continue
         try:
-            paths = list(candidate.rglob("*"))
+            size = path.stat().st_size
+            path.unlink()
+            deleted += 1
+            bytes_freed += size
         except OSError as exc:
             failed += 1
-            errors.append(f"{candidate}: {exc}")
-            continue
+            errors.append(f"{path}: {exc}")
 
-        for path in paths:
-            if path.suffix.lower() not in RAW_EXTENSIONS:
-                continue
-            try:
-                size = path.stat().st_size
-                path.unlink()
-                deleted += 1
-                bytes_freed += size
-            except OSError as exc:
-                failed += 1
-                errors.append(f"{path}: {exc}")
+    return RawDeletionFolderResult(
+        work_id=folder.work_id,
+        photographer=folder.photographer,
+        deleted=deleted,
+        failed=failed,
+        bytes_freed=bytes_freed,
+        errors=tuple(errors[:50]),
+    )
 
-    return RawDeletionResult(deleted=deleted, failed=failed, bytes_freed=bytes_freed, errors=tuple(errors[:100]))
+
+def delete_snapshot_raw_files(
+    snapshot: OperationalInventory,
+    work_ids: Iterable[str] | None = None,
+) -> RawDeletionResult:
+    """Exclui CR2/CR3/DNG somente das pastas escolhidas do snapshot confirmado."""
+    root = Path(snapshot.root).resolve()
+    selected = snapshot.select(work_ids)
+    results: list[RawDeletionFolderResult] = []
+
+    workers = max(1, min(MAX_WORKERS, len(selected)))
+    if selected:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="raw-cleanup") as executor:
+            futures = [executor.submit(_delete_folder_raw_files, root, folder) for folder in selected]
+            for future in as_completed(futures):
+                results.append(future.result())
+
+    results.sort(key=lambda item: (item.photographer.lower(), item.work_id.lower()))
+    errors = [error for result in results for error in result.errors]
+    return RawDeletionResult(
+        deleted=sum(item.deleted for item in results),
+        failed=sum(item.failed for item in results),
+        bytes_freed=sum(item.bytes_freed for item in results),
+        errors=tuple(errors[:100]),
+        folders=tuple(results),
+    )
