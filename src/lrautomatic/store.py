@@ -63,6 +63,9 @@ class JobStore:
         ]
         total_discovered = sum(item.discovered for item in progress)
         job = ImportJob(request=request, progress=progress, total_discovered=total_discovered)
+        if request.organize_collections_by_photographer or request.organize_collections_by_client:
+            job.collections_status = "requested"
+            job.collections_run_once_token = job.job_id
         if request.build_standard_previews:
             job.standard_previews_status = "requested"
         if request.build_smart_previews:
