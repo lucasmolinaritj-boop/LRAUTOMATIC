@@ -164,27 +164,28 @@ def run_forever(config_path: str | Path = "config.json") -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     store = JobStore(settings)
-    scheduler: HomePiczScheduler | None = None
+    scheduler = HomePiczScheduler(settings, store, config_path=config_path)
+    scheduler.start()
     forced_job_active = False
 
-    def start_scheduler() -> HomePiczScheduler:
-        instance = HomePiczScheduler(settings, store, config_path=config_path)
-        instance.start()
-        return instance
-
     control = read_control(settings)
-    if not control["paused"]:
-        scheduler = start_scheduler()
-        _write_startup_state(settings, status="checking_homepicz_now")
-    else:
-        _write_startup_state(settings, status="automation_paused")
+    _write_startup_state(
+        settings,
+        status="automation_paused_queue_active" if control["paused"] else "checking_homepicz_now",
+        message=(
+            "Criação de jobs ativa; início de novos jobs pausado."
+            if control["paused"]
+            else "Automação ativa."
+        ),
+    )
 
     log.info(
-        "Agente iniciado: controle pelo Monitor ativo; catálogo será conferido a cada %ss",
+        "Agente iniciado: scheduler sempre ativo; pausa controla somente o início de jobs; catálogo conferido a cada %ss",
         CATALOG_POLL_SECONDS,
     )
 
     lightroom_seen = bool(_lightroom_processes())
+    last_paused = bool(control["paused"])
     try:
         while True:
             try:
@@ -193,24 +194,26 @@ def run_forever(config_path: str | Path = "config.json") -> None:
                 force_pending = bool(control["force_next_requested"])
                 running_job, queued_job = _job_states(store)
 
-                if paused and scheduler is not None:
-                    scheduler.stop()
-                    scheduler = None
-                    log.info("Automação pausada pelo Monitor; job em execução não foi interrompido")
-                    _write_startup_state(
-                        settings,
-                        status="automation_paused_waiting_running" if running_job else "automation_paused",
-                    )
-                elif not paused and scheduler is None:
-                    scheduler = start_scheduler()
-                    log.info("Automação retomada pelo Monitor")
-                    _write_startup_state(settings, status="automation_resumed")
+                if paused != last_paused:
+                    if paused:
+                        log.info("Início de novos jobs pausado; scheduler continuará criando tarefas")
+                        _write_startup_state(
+                            settings,
+                            status="automation_paused_waiting_running" if running_job else "automation_paused_queue_active",
+                            message="Jobs continuam sendo criados e enfileirados; nenhum novo job será iniciado.",
+                        )
+                    else:
+                        log.info("Início de jobs retomado pelo Monitor")
+                        _write_startup_state(settings, status="automation_resumed")
+                    last_paused = paused
 
                 if force_pending and not running_job:
-                    if scheduler is not None:
-                        scheduler.stop()
-                        scheduler = None
+                    # Evita dois ciclos Home Picz simultâneos, mas a pausa nunca desliga
+                    # permanentemente o scheduler nem impede a criação normal de jobs.
+                    scheduler.stop()
                     result = run_cycle(settings, store)
+                    scheduler = HomePiczScheduler(settings, store, config_path=config_path)
+                    scheduler.start()
                     forced_job_active = True
                     consume_force_next(
                         settings,
@@ -218,10 +221,10 @@ def run_forever(config_path: str | Path = "config.json") -> None:
                     )
                     log.info("Próximo job forçado pelo Monitor: %s", result)
                     _write_startup_state(settings, status="forced_cycle_completed", result=result)
-                    if not paused:
-                        scheduler = start_scheduler()
                     running_job, queued_job = _job_states(store)
 
+                # Pausado: não abre/troca catálogo para jobs aguardando. Um trabalho já
+                # em execução continua normalmente. O bypass forçado pode iniciar um.
                 may_manage_catalog = (not paused) or running_job or forced_job_active
                 if may_manage_catalog:
                     opened_now = ensure_correct_catalog(settings)
@@ -250,8 +253,7 @@ def run_forever(config_path: str | Path = "config.json") -> None:
                 log.exception("Falha no ciclo do agente")
             time.sleep(CATALOG_POLL_SECONDS)
     finally:
-        if scheduler is not None:
-            scheduler.stop()
+        scheduler.stop()
 
 
 def main() -> None:
