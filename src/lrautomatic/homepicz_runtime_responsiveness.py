@@ -11,21 +11,33 @@ from .homepicz_scheduler_guard import next_poll_seconds
 
 
 class ResponsiveHomePiczScheduler(scheduler.HomePiczScheduler):
-    """Scheduler acordável, sem criar uma segunda varredura concorrente."""
+    """Scheduler acordável, pausável e sem varreduras concorrentes."""
 
     def __init__(self, settings, store, config_path=None):
         super().__init__(settings, store, config_path=config_path)
         self.wake_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.force_cycle_event = threading.Event()
         self.cycle_in_progress = threading.Event()
         self.cycle_generation = 0
         self.last_result: dict[str, object] | None = None
 
-    def request_immediate_cycle(self) -> int:
-        """Agenda um ciclo imediato.
+    def set_paused(self, paused: bool) -> None:
+        """Suspende ou retoma o scheduler sem consultar API nem varrer o disco."""
+        if paused:
+            self.pause_event.set()
+        else:
+            self.pause_event.clear()
+        self.wake_event.set()
 
-        Se uma varredura já estiver em andamento, o pedido fica latente e executa
-        logo depois, sem abrir um segundo leitor concorrente do Google Drive.
+    def request_immediate_cycle(self, *, allow_while_paused: bool = False) -> int:
+        """Agenda um ciclo imediato sem criar uma segunda varredura concorrente.
+
+        Quando ``allow_while_paused`` é verdadeiro, exatamente um ciclo pode rodar
+        durante a pausa. Isso é usado pelo botão Forçar próximo job.
         """
+        if allow_while_paused:
+            self.force_cycle_event.set()
         self.wake_event.set()
         return self.cycle_generation
 
@@ -42,6 +54,8 @@ class ResponsiveHomePiczScheduler(scheduler.HomePiczScheduler):
         wait_started = time.monotonic()
         scheduled_seconds = max(1, int(next_poll_seconds()))
         while not self.stop_event.is_set():
+            if self.pause_event.is_set():
+                return
             if self.wake_event.is_set():
                 self.wake_event.clear()
                 return
@@ -54,14 +68,36 @@ class ResponsiveHomePiczScheduler(scheduler.HomePiczScheduler):
                 if elapsed >= scheduled_seconds:
                     return
 
-            remaining = scheduled_seconds - (time.monotonic() - wait_started)
+            remaining = scheduled_seconds - (time.monotonic() - cycle_finished_at)
             if remaining <= 0:
                 return
-            self.stop_event.wait(min(getattr(scheduler, "CONFIG_POLL_SECONDS", 1.0), remaining))
+            self.wake_event.wait(min(getattr(scheduler, "CONFIG_POLL_SECONDS", 1.0), remaining))
+
+    def _wait_for_resume_or_force(self) -> bool:
+        """Espera sem I/O enquanto pausado; retorna True para executar um ciclo."""
+        while not self.stop_event.is_set():
+            if self.force_cycle_event.is_set():
+                self.force_cycle_event.clear()
+                return True
+            if not self.pause_event.is_set():
+                return True
+            self.wake_event.wait()
+            self.wake_event.clear()
+        return False
 
     def _loop(self) -> None:
         first_cycle = True
         while not self.stop_event.is_set():
+            if self.pause_event.is_set() and not self.force_cycle_event.is_set():
+                if not self._wait_for_resume_or_force():
+                    break
+
+            if self.stop_event.is_set():
+                break
+
+            # Um pedido forçado é consumido somente quando o ciclo realmente começa.
+            self.force_cycle_event.clear()
+            self.wake_event.clear()
             self._reload_settings_if_changed()
             started_at = datetime.now().isoformat(timespec="seconds")
             self.cycle_in_progress.set()
@@ -91,6 +127,9 @@ class ResponsiveHomePiczScheduler(scheduler.HomePiczScheduler):
                 if first_cycle:
                     self.first_cycle_done.set()
                     first_cycle = False
+
+            if self.pause_event.is_set():
+                continue
 
             cycle_finished_at = time.monotonic()
             self._wait_until_next_cycle(cycle_finished_at)
