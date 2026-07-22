@@ -5,8 +5,8 @@ import os
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
-from datetime import datetime, timezone
+from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 
 from .config import Settings
@@ -145,7 +145,7 @@ class JobStore:
 
     def create(self, request: ImportJobRequest) -> ImportJob:
         with self._lock:
-            lock_context = self._process_create_lock() if self._is_homepicz_request(request) else contextmanager(lambda: (yield))()
+            lock_context = self._process_create_lock() if self._is_homepicz_request(request) else nullcontext()
             with lock_context:
                 if self._is_homepicz_request(request):
                     self.recover_stale_running_jobs()
