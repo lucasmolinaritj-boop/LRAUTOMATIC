@@ -9,6 +9,18 @@ def install_homepicz_queue_guard() -> None:
     except Exception:
         return
 
+    # Corrige uma regressão no scheduler: bool(...).startswith(...) sempre falha,
+    # pois bool() devolve True/False. A função segura mantém compatibilidade com
+    # jobs antigos e valores ausentes ou inesperados em collection_set.
+    def safe_is_homepicz_job(job) -> bool:
+        request = getattr(job, "request", None)
+        collection_set = getattr(request, "collection_set", None)
+        return str(collection_set or "").startswith(
+            getattr(scheduler, "HOME_PICZ_COLLECTION_PREFIX", "Home Picz - ")
+        )
+
+    scheduler._is_homepicz_job = safe_is_homepicz_job
+
     original = getattr(scheduler, "run_cycle", None)
     if original is not None and not getattr(original, "_homepicz_guarded", False):
         def wrapped(settings, store, now=None):
