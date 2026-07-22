@@ -20,7 +20,7 @@ dependencies = [
 
 [project.scripts]
 lrautomatic = "lrautomatic.cli:app"
-lrautomatic-desktop = "lrautomatic.desktop_stable:main"
+lrautomatic-desktop = "lrautomatic.desktop_raw_calendar:main"
 lrautomatic-session-agent = "lrautomatic.session_agent_stable:main"
 lrautomatic-service = "lrautomatic.windows_service:main"
 
