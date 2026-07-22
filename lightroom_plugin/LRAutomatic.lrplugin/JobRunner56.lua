@@ -44,6 +44,35 @@ source = replaceOnce(source,
     "local files,scanError,reusedInventory=collectFiles(source.path,source.recursive==true,allowed,progress.discovered_files); progress.discovered=#files; progress.status=scanError and 'failed' or 'running'; progress.error=scanError; if not scanError and not reusedInventory then progress.discovered_files=files; progress.scan_completed=true; progress.scan_completed_at=timestamp() end; job.inventory_reused_count=(job.inventory_reused_count or 0)+(reusedInventory and 1 or 0)",
     'uso do inventário persistente')
 
+-- ARQUIVOS DANIFICADOS: isola a falha no nível da foto. Arquivo inexistente,
+-- zero bytes ou ilegível não chega ao addPhoto e é registrado para auditoria.
+-- Falhas de importação são colocadas em blacklist somente durante o job atual,
+-- evitando dez novas tentativas e novos popups para o mesmo caminho.
+source = replaceOnce(source,
+    "local function importOneAttempt(catalog,path)\n    if not path or path=='' then return nil,'failed','caminho vazio' end",
+    "local badFilesInJob={}\nlocal function corruptedReportPath() return LrPathUtils.child(logsDir(),'corrupted_files.txt') end\nlocal function recordBadFile(job,path,reason)\n    local key=tostring(path or '')\n    if key=='' or badFilesInJob[key] then return end\n    badFilesInJob[key]=tostring(reason or 'erro desconhecido')\n    job.bad_files=type(job.bad_files)=='table' and job.bad_files or {}\n    table.insert(job.bad_files,{path=key,reason=tostring(reason or 'erro desconhecido'),at=timestamp()})\n    job.bad_files_count=#job.bad_files\n    appendText(corruptedReportPath(),timestamp()..' job='..tostring(job.job_id)..' path='..key..' reason='..tostring(reason or 'erro desconhecido')..'\\n')\n    appendJobEvent(job,'bad_file','Arquivo ignorado por possível corrupção',key..' — '..tostring(reason or 'erro desconhecido'),'warning')\n    plainLog('BAD_FILE_SKIPPED path='..key..' reason='..tostring(reason or 'erro desconhecido'))\nend\nlocal function validateImportFile(path)\n    if not path or path=='' then return false,'caminho vazio' end\n    if not LrFileUtils.exists(path) then return false,'arquivo não encontrado ou offline' end\n    local file,openError=io.open(path,'rb')\n    if not file then return false,'arquivo não pôde ser aberto: '..tostring(openError or 'erro de leitura') end\n    local firstByte=file:read(1)\n    local size=file:seek('end')\n    file:close()\n    if not size or size<=0 or not firstByte then return false,'arquivo vazio (0 bytes) ou ilegível' end\n    return true,nil\nend\n\nlocal function importOneAttempt(catalog,path)\n    if not path or path=='' then return nil,'failed','caminho vazio' end",
+    'helpers de isolamento de arquivo danificado')
+
+source = replaceOnce(source,
+    "local function importOneWithRetry(catalog,path,job,jobPath)\n    local lastError=nil\n    for attempt=1,MAX_ATTEMPTS do",
+    "local function importOneWithRetry(catalog,path,job,jobPath)\n    if badFilesInJob[path] then return nil,'bad_file',badFilesInJob[path] end\n    local valid,validationError=validateImportFile(path)\n    if not valid then recordBadFile(job,path,validationError); safeWriteJob(jobPath,job); return nil,'bad_file',validationError end\n    local lastError=nil\n    for attempt=1,MAX_ATTEMPTS do",
+    'pré-validação antes do Lightroom')
+
+source = replaceOnce(source,
+    "        lastError=err\n        if attempt<MAX_ATTEMPTS then",
+    "        lastError=err\n        local lowered=string.lower(tostring(err or ''))\n        local permanent=string.find(lowered,'arquivo',1,true) or string.find(lowered,'corrupt',1,true) or string.find(lowered,'damaged',1,true) or string.find(lowered,'inválid',1,true) or string.find(lowered,'invalid',1,true) or string.find(lowered,'unsupported',1,true) or string.find(lowered,'não apareceu',1,true)\n        if permanent then recordBadFile(job,path,lastError); safeWriteJob(jobPath,job); return nil,'bad_file',lastError end\n        if attempt<MAX_ATTEMPTS then",
+    'interromper retries permanentes')
+
+source = replaceOnce(source,
+    "    return nil,'failed',lastError or 'falha desconhecida após 10 tentativas'\nend",
+    "    recordBadFile(job,path,lastError or 'falha desconhecida após 10 tentativas')\n    safeWriteJob(jobPath,job)\n    return nil,'bad_file',lastError or 'falha desconhecida após 10 tentativas'\nend",
+    'blacklist depois das tentativas')
+
+source = replaceOnce(source,
+    "else progress.failed=progress.failed+1; progress.error=tostring(err)..': '..tostring(path) end",
+    "elseif result=='bad_file' then progress.failed=progress.failed+1; progress.error='Arquivo danificado ignorado: '..tostring(path)..' — '..tostring(err); job.completed_with_file_errors=true else progress.failed=progress.failed+1; progress.error=tostring(err)..': '..tostring(path) end",
+    'continuar pasta após arquivo danificado')
+
 -- Persistência em lote para todos os resultados. A interface não precisa de uma
 -- gravação por foto: salva a cada 10 itens ou 2 segundos e sempre ao fechar a pasta.
 source = replaceOnce(source,
