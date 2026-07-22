@@ -23,13 +23,23 @@ def install_homepicz_queue_guard() -> None:
 
     def guarded_wait(self, cycle_finished_at):
         # O intervalo entre jobs é decidido pela guarda usando finished_at.
-        # Aqui apenas aguardamos o próximo instante de polling sugerido.
+        # Durante a espera, qualquer alteração no arquivo de configuração recalcula
+        # imediatamente o próximo polling. Não exige reinstalação nem reinício do serviço.
         import time
 
         wait_started = time.monotonic()
+        scheduled_seconds = max(1, int(next_poll_seconds()))
         while not self.stop_event.is_set():
-            self._reload_settings_if_changed()
-            remaining = next_poll_seconds() - (time.monotonic() - wait_started)
+            settings_changed = self._reload_settings_if_changed()
+            if settings_changed:
+                elapsed = time.monotonic() - wait_started
+                configured_seconds = max(60, int(self.settings.homepicz_interval_minutes or 1) * 60)
+                current_suggestion = max(1, int(next_poll_seconds()))
+                scheduled_seconds = min(configured_seconds, current_suggestion)
+                if elapsed >= scheduled_seconds:
+                    return
+
+            remaining = scheduled_seconds - (time.monotonic() - wait_started)
             if remaining <= 0:
                 return
             self.stop_event.wait(min(getattr(scheduler, "CONFIG_POLL_SECONDS", 1.0), remaining))
