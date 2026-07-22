@@ -5,7 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 DEFAULT_PHOTO_EXTENSIONS = ['cr2', 'cr3', 'dng']
@@ -53,6 +53,8 @@ class SourceStatus(StrEnum):
 
 
 class ImportSource(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
     path: str
     collection: str | None = None
     recursive: bool | None = None
@@ -74,6 +76,8 @@ class ImportSource(BaseModel):
 
 
 class ImportJobRequest(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
     sources: list[ImportSource] = Field(min_length=1)
     collection_set: str | None = None
     recursive: bool = False
@@ -96,6 +100,8 @@ class ImportJobRequest(BaseModel):
 
 
 class SourceProgress(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
     path: str
     collection: str | None = None
     status: SourceStatus = SourceStatus.QUEUED
@@ -104,9 +110,14 @@ class SourceProgress(BaseModel):
     skipped: int = 0
     failed: int = 0
     error: str | None = None
+    discovered_files: list[str] = Field(default_factory=list)
+    scan_completed: bool = False
+    scan_completed_at: str | None = None
 
 
 class JobEvent(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
     at: str = Field(default_factory=utc_now)
     stage: str
     title: str
@@ -115,7 +126,9 @@ class JobEvent(BaseModel):
 
 
 class ImportJob(BaseModel):
-    schema_version: int = 9
+    model_config = ConfigDict(extra='allow')
+
+    schema_version: int = 10
     job_id: str = Field(default_factory=lambda: f'job_{uuid4().hex}')
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -130,22 +143,30 @@ class ImportJob(BaseModel):
     total_skipped: int = 0
     total_failed: int = 0
     current_source: str | None = None
+    current_photo: str | None = None
+    current_stage: str | None = None
     active_catalog_path: str | None = None
     error: str | None = None
     runner_instance_id: str | None = None
     runner_heartbeat_epoch: int | None = None
     runner_heartbeat_at: str | None = None
     interrupted_at: str | None = None
+    import_attempts_total: int = 0
+    inventory_reused_count: int = 0
     preset_status: str = 'not_requested'
     preset_name_applied: str | None = None
     preset_applied_count: int = 0
+    preset_candidate_count: int = 0
+    preset_skipped_existing_count: int = 0
     standard_previews_status: str = 'not_requested'
     standard_previews_created: int = 0
     standard_previews_failed: int = 0
+    standard_previews_attempts_total: int = 0
     smart_previews_status: str = 'not_requested'
     smart_previews_created: int = 0
     smart_previews_existed: int = 0
     smart_previews_failed: int = 0
+    smart_preview_recheck_skipped: int = 0
     collections_status: str = 'not_requested'
     collections_created: int = 0
     collection_sets_created: int = 0
