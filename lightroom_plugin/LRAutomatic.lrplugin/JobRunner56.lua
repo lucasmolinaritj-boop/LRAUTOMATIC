@@ -20,21 +20,22 @@ source = replaceOnce(source,
     "job.preset_candidate_count=#importedPhotos; job.preset_skipped_existing_count=job.total_skipped or 0; local presetOk=applyPreset(catalog,importedPhotos,job,jobPath); safeWriteJob(jobPath,job)",
     'auditoria de isolamento do preset')
 
--- Persistência em lote: ignoradas não precisam regravar o JSON a cada item.
+-- Persistência em lote para todos os resultados. A interface não precisa de uma
+-- gravação por foto: salva a cada 10 itens ou 2 segundos e sempre ao fechar a pasta.
 source = replaceOnce(source,
     "    local photosForCollection={}\n    for _,path in ipairs(files) do",
-    "    local photosForCollection={}\n    local skippedSinceWrite=0\n    local lastProgressWrite=os.time()\n    for _,path in ipairs(files) do",
+    "    local photosForCollection={}\n    local progressSinceWrite=0\n    local lastProgressWrite=os.time()\n    for _,path in ipairs(files) do",
     'estado de progresso em lote')
 
 source = replaceOnce(source,
     "        refreshTotals(job); safeWriteJob(jobPath,job); LrTasks.yield()",
-    "        refreshTotals(job)\n        if result=='skipped' then\n            skippedSinceWrite=skippedSinceWrite+1\n            local now=os.time()\n            if skippedSinceWrite>=25 or (now-lastProgressWrite)>=1 then\n                safeWriteJob(jobPath,job)\n                skippedSinceWrite=0\n                lastProgressWrite=now\n                LrTasks.yield()\n            end\n        else\n            safeWriteJob(jobPath,job)\n            skippedSinceWrite=0\n            lastProgressWrite=os.time()\n            LrTasks.yield()\n        end",
-    'persistência agrupada de ignoradas')
+    "        refreshTotals(job)\n        progressSinceWrite=progressSinceWrite+1\n        local now=os.time()\n        if progressSinceWrite>=10 or (now-lastProgressWrite)>=2 then\n            safeWriteJob(jobPath,job)\n            progressSinceWrite=0\n            lastProgressWrite=now\n        end\n        LrTasks.yield()",
+    'persistência agrupada de progresso')
 
 source = replaceOnce(source,
     "    local collectionName=source.collection; if not collectionName or collectionName=='' then collectionName=LrPathUtils.leafName(source.path or '') end",
-    "    if skippedSinceWrite>0 then safeWriteJob(jobPath,job) end\n    local collectionName=source.collection; if not collectionName or collectionName=='' then collectionName=LrPathUtils.leafName(source.path or '') end",
-    'flush final do lote de ignoradas')
+    "    if progressSinceWrite>0 then safeWriteJob(jobPath,job) end\n    local collectionName=source.collection; if not collectionName or collectionName=='' then collectionName=LrPathUtils.leafName(source.path or '') end",
+    'flush final do lote de progresso')
 ]=]
 
 io.open = function(path, mode)
