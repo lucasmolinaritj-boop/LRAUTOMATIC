@@ -73,6 +73,70 @@ source = replaceOnce(source,
     "elseif result=='bad_file' then progress.failed=progress.failed+1; progress.error='Arquivo danificado ignorado: '..tostring(path)..' — '..tostring(err); job.completed_with_file_errors=true else progress.failed=progress.failed+1; progress.error=tostring(err)..': '..tostring(path) end",
     'continuar pasta após arquivo danificado')
 
+-- FILA RESILIENTE: um JSON marcado como running só pode bloquear a fila quando
+-- existe um claim vivo que realmente aponta para aquele job e está processando.
+-- Jobs órfãos são recuperados imediatamente, sem aguardar 45 segundos.
+source = replaceOnce(source,
+[[local function recoverOrBlockRunningJobs()
+    local now=os.time(); local foundActive=false
+    for path in LrFileUtils.files(jobsDir()) do
+        if isJobFile(path) then
+            local job=readJson(path)
+            if job and tostring(job.status)=='running' then
+                local age=now-(tonumber(job.runner_heartbeat_epoch) or 0)
+                if age<=JOB_STALE_SECONDS then
+                    foundActive=true
+                    plainLog('RUNNING_JOB_BLOCK id='..tostring(job.job_id)..' owner='..tostring(job.runner_instance_id)..' age='..age)
+                else
+                    job.status='queued'; job.recovered_at=timestamp(); job.recovery_count=(job.recovery_count or 0)+1; job.current_stage='recovered'
+                    appendJobEvent(job,'recovered','Tarefa recuperada após interrupção','O runner anterior ficou sem heartbeat por '..age..' segundos.','warning')
+                    writeJsonAtomic(path,job)
+                    plainLog('RUNNING_JOB_RECOVERED id='..tostring(job.job_id)..' age='..age)
+                end
+            end
+        end
+    end
+    return foundActive
+end]],
+[[local function recoverOrBlockRunningJobs()
+    local now=os.time(); local foundActive=false
+    local liveByJob={}
+    for _,claim in ipairs(activeClaims()) do
+        if claim.processing==true and claim.current_job_id then
+            liveByJob[tostring(claim.current_job_id)]=tostring(claim.instance_id or '')
+        end
+    end
+    for path in LrFileUtils.files(jobsDir()) do
+        if isJobFile(path) then
+            local job=readJson(path)
+            if job and tostring(job.status)=='running' then
+                local jobId=tostring(job.job_id or '')
+                local owner=tostring(job.runner_instance_id or '')
+                local liveOwner=liveByJob[jobId]
+                local age=now-(tonumber(job.runner_heartbeat_epoch) or 0)
+                if liveOwner and liveOwner==owner then
+                    foundActive=true
+                    plainLog('RUNNING_JOB_BLOCK id='..jobId..' owner='..owner..' age='..age..' claim=live')
+                else
+                    job.status='queued'; job.recovered_at=timestamp(); job.recovery_count=(job.recovery_count or 0)+1; job.current_stage='recovered_orphan'; job.runner_instance_id=nil
+                    appendJobEvent(job,'recovered','Tarefa órfã devolvida à fila','Nenhum runner ativo possuía este job. Recuperação imediata.','warning')
+                    writeJsonAtomic(path,job)
+                    plainLog('RUNNING_JOB_RECOVERED_ORPHAN id='..jobId..' owner='..owner..' age='..age)
+                end
+            end
+        end
+    end
+    return foundActive
+end]],
+    'recuperação imediata de job running órfão')
+
+-- Qualquer exceção inesperada em um ciclo é registrada e o estado ativo é limpo,
+-- permitindo que o loop continue e processe o próximo job em vez de morrer.
+source = replaceOnce(source,
+    "        Runner.processQueuedOnce()\n        LrTasks.sleep(1)",
+    "        local cycleOk,cycleError=xpcall(function() Runner.processQueuedOnce() end,function(err) return debug and debug.traceback and debug.traceback(tostring(err),2) or tostring(err) end)\n        if not cycleOk then\n            plainLog('QUEUE_CYCLE_EXCEPTION '..tostring(cycleError))\n            if activeJobPath and activeJob then\n                local disk=readJson(activeJobPath)\n                if disk and tostring(disk.status)=='running' then\n                    disk.status='queued'; disk.current_stage='recovered_exception'; disk.recovery_count=(disk.recovery_count or 0)+1; disk.runner_instance_id=nil\n                    appendJobEvent(disk,'recovered','Runner recuperado após exceção',tostring(cycleError),'error')\n                    writeJsonAtomic(activeJobPath,disk)\n                end\n            end\n            clearActive(); leaderSince=nil\n        end\n        LrTasks.sleep(1)",
+    'proteção do ciclo principal da fila')
+
 -- Persistência em lote para todos os resultados. A interface não precisa de uma
 -- gravação por foto: salva a cada 10 itens ou 2 segundos e sempre ao fechar a pasta.
 source = replaceOnce(source,
