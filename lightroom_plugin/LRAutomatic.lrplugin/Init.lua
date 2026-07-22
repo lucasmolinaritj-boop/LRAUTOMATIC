@@ -1,19 +1,16 @@
-local LrTasks = import 'LrTasks'
-
--- Encerra loops deixados por recargas anteriores antes de iniciar uma nova geração.
+-- Evita duas instâncias do loop da versão anterior.
 _G.LRAutomaticShutdown = true
 _G.LRAutomaticGeneration = (_G.LRAutomaticGeneration or 0) + 1
 local myGeneration = _G.LRAutomaticGeneration
 _G.LRAutomaticLoopRunning = false
-_G.LRAutomaticVersion = '4.9.8-pause-start-gate-lr104'
+_G.LRAutomaticVersion = '4.9.5-catalog-cache-fast-standard-preview-lr104'
 _G.LRAutomaticLastError = nil
 
 LrTasks.startAsyncTask(function()
     LrTasks.sleep(3)
     if myGeneration ~= _G.LRAutomaticGeneration then return end
 
-    -- pcall somente no carregamento: chamadas SDK que cedem ao scheduler ficam fora dele.
-    local okRequire, Runner = pcall(require, 'JobRunner58')
+    local okRequire, Runner = pcall(require, 'JobRunner55')
     if not okRequire then
         _G.LRAutomaticLastError = tostring(Runner)
         return
@@ -21,12 +18,12 @@ LrTasks.startAsyncTask(function()
 
     _G.LRAutomaticShutdown = false
     _G.LRAutomaticLoopRunning = true
-    _G.LRAutomaticLastError = nil
-
-    Runner.runLoop(function()
-        return _G.LRAutomaticShutdown == true or myGeneration ~= _G.LRAutomaticGeneration
+    local okRun, runError = pcall(function()
+        Runner.start()
     end)
-
+    if not okRun then
+        _G.LRAutomaticLastError = tostring(runError)
+    end
     if myGeneration == _G.LRAutomaticGeneration then
         _G.LRAutomaticLoopRunning = false
     end

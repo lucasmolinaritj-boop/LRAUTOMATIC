@@ -1,86 +1,132 @@
--- Corrige a contabilidade ambígua de previews no Lightroom Classic 10.4.
--- Quando buildSmartPreviews retorna zero criadas/existentes/falhas para uma fila
--- não vazia, as fotos não podem ser declaradas concluídas. Elas permanecem no
--- ledger e são retomadas em jobs seguintes, mesmo já estando no catálogo.
+-- Otimizações de desempenho sobre o JobRunner54.
+-- Mantém toda a cadeia anterior intacta e injeta cache do catálogo por job.
 local LrPathUtils = import 'LrPathUtils'
 
 local originalOpen = io.open
 local targetPath = LrPathUtils.child(_PLUGIN.path, 'JobRunner51.lua')
 
 local injection = [=[
--- PREVIEW RETRY AUDIT: resposta vazia/ambígua nunca significa sucesso.
+-- CACHE DE CATÁLOGO: indexa todas as fotos uma vez por job para evitar
+-- catalog:findPhotoByPath(path) em cada arquivo já importado.
 source = replaceOnce(source,
-[[        local result=catalog:buildSmartPreviews(pending)
-        if isCancelled(jobPath,job) or not stillOwns(jobPath,job) then return false end
-        local created=result and result.created or {}; local existed=result and result.existed or {}; local failed=result and result.failed or pending
-        createdTotal=createdTotal+#created; existedTotal=existedTotal+#existed; pending=failed
-        job.smart_previews_created=createdTotal; job.smart_previews_existed=existedTotal; job.smart_previews_failed=#pending; job.smart_previews_pending=#pending
-        safeWriteJob(jobPath,job)
-        if #pending==0 then for _,p in ipairs(inputPhotos) do local path=photoPath(p); if path then previewRetry.smart[path]=nil end end; savePreviewRetry(); job.smart_previews_status='completed'; return true end]],
-[[        local attempted=pending
-        local callOk,result=pcall(function() return catalog:buildSmartPreviews(attempted) end)
-        if isCancelled(jobPath,job) or not stillOwns(jobPath,job) then return false end
-        if not callOk then
-            plainLog('SMART_PREVIEW_EXCEPTION error='..tostring(result)..' attempted='..tostring(#attempted))
-            result=nil
-        end
+[[local function importOneAttempt(catalog,path)]],
+[[local catalogPhotoIndex=nil
+local catalogPhotoIndexCatalogPath=nil
 
-        local created=(type(result)=='table' and type(result.created)=='table') and result.created or {}
-        local existed=(type(result)=='table' and type(result.existed)=='table') and result.existed or {}
-        local explicitFailed=(type(result)=='table' and type(result.failed)=='table') and result.failed or {}
-        local accounted={}
-        for _,p in ipairs(created) do accounted[tostring(p)]=true end
-        for _,p in ipairs(existed) do accounted[tostring(p)]=true end
-        for _,p in ipairs(explicitFailed) do accounted[tostring(p)]=true end
+local function normalizeCatalogPath(path)
+    if not path then return nil end
+    return string.lower((tostring(path):gsub('/','\\')))
+end
 
-        local unresolved={}
-        for _,p in ipairs(explicitFailed) do table.insert(unresolved,p) end
-        for _,p in ipairs(attempted) do
-            if not accounted[tostring(p)] then table.insert(unresolved,p) end
-        end
+local function buildCatalogPhotoIndex(catalog)
+    local index={}
+    if not catalog or type(catalog.getAllPhotos)~='function' then return index end
+    local ok,photos=pcall(function() return catalog:getAllPhotos() end)
+    if not ok or type(photos)~='table' then
+        plainLog('CATALOG_INDEX_FAILED error='..tostring(photos))
+        return index
+    end
+    for _,photo in ipairs(photos) do
+        local path=nil
+        local pathOk,pathValue=pcall(function() return photo:getRawMetadata('path') end)
+        if pathOk then path=pathValue end
+        local key=normalizeCatalogPath(path)
+        if key then index[key]=photo end
+    end
+    plainLog('CATALOG_INDEX_READY count='..tostring(#photos))
+    return index
+end
 
-        createdTotal=createdTotal+#created
-        existedTotal=existedTotal+#existed
-        pending=unresolved
-        job.smart_previews_created=createdTotal
-        job.smart_previews_existed=existedTotal
-        job.smart_previews_failed=#pending
-        job.smart_previews_pending=#pending
+local function ensureCatalogPhotoIndex(catalog)
+    local catalogPath=nil
+    if catalog and type(catalog.getPath)=='function' then
+        local ok,value=pcall(function() return catalog:getPath() end)
+        if ok then catalogPath=value end
+    end
+    if catalogPhotoIndex==nil or catalogPhotoIndexCatalogPath~=catalogPath then
+        catalogPhotoIndex=buildCatalogPhotoIndex(catalog)
+        catalogPhotoIndexCatalogPath=catalogPath
+    end
+    return catalogPhotoIndex
+end
 
-        -- Enquanto o Smart Preview estiver sem confirmação, mantém também o
-        -- Standard Preview pendente. requestJpegThumbnail pode devolver o preview
-        -- embutido/cache e não provar que o Standard persistente foi construído.
-        for _,p in ipairs(pending) do
-            local path=photoPath(p)
-            if path then
-                previewRetry.smart[path]=true
-                previewRetry.standard[path]=true
-            end
-        end
-        savePreviewRetry()
-        safeWriteJob(jobPath,job)
+local function importOneAttempt(catalog,path)]],
+'cache de catálogo por job')
 
-        if #pending==0 then
-            for _,p in ipairs(inputPhotos) do
-                local path=photoPath(p)
-                if path then previewRetry.smart[path]=nil end
-            end
-            savePreviewRetry()
-            job.smart_previews_status='completed'
-            return true
-        end
+source = replaceOnce(source,
+[[    local findMethod=catalog.findPhotoByPath
+    if type(findMethod)~='function' then
+        plainLog('ADD_PHOTO_API_UNAVAILABLE method=findPhotoByPath catalog='..tostring(activePath)..' photo='..tostring(path))
+        return nil,'failed','API findPhotoByPath indisponível'
+    end
+    local beforeOk,before=pcall(findMethod,catalog,path)
+    if not beforeOk then
+        plainLog('ADD_PHOTO_FIND_EXCEPTION phase=before photo='..tostring(path)..' error='..tostring(before))
+        return nil,'failed',tostring(before)
+    end
+    if before then return before,'skipped',nil end]],
+[[    local index=ensureCatalogPhotoIndex(catalog)
+    local normalizedPath=normalizeCatalogPath(path)
+    local before=normalizedPath and index[normalizedPath] or nil
+    if before then return before,'skipped',nil end
 
-        if #created==0 and #existed==0 and #explicitFailed==0 then
-            plainLog('SMART_PREVIEW_AMBIGUOUS_ZERO attempted='..tostring(#attempted)..' retry='..tostring(#pending))
-        end]],
-    'contabilidade verificável de Smart Preview')
+    local findMethod=catalog.findPhotoByPath]],
+'consulta individual substituída por cache')
 
--- Um thumbnail retornado pelo cache não limpa o retry padrão enquanto o Smart
--- Preview da mesma foto ainda estiver sem confirmação.
+source = replaceOnce(source,
+[[    if imported then return imported,'imported',nil end
+
+    local afterOk,after=pcall(findMethod,catalog,path)]],
+[[    if imported then
+        if normalizedPath then index[normalizedPath]=imported end
+        return imported,'imported',nil
+    end
+
+    if type(findMethod)~='function' then
+        return nil,'failed','foto não retornada por addPhoto e API findPhotoByPath indisponível'
+    end
+    local afterOk,after=pcall(findMethod,catalog,path)]],
+'cache após addPhoto')
+
+source = replaceOnce(source,
+[[    if after then return after,'imported',nil end]],
+[[    if after then
+        if normalizedPath then index[normalizedPath]=after end
+        return after,'imported',nil
+    end]],
+'cache após confirmação')
+
+source = replaceOnce(source,
+[[local MAX_ATTEMPTS = 10
+local RETRY_DELAY_SECONDS = 60]],
+[[local MAX_ATTEMPTS = 10
+local RETRY_DELAY_SECONDS = 60
+local STANDARD_PREVIEW_MAX_ATTEMPTS = 3
+local STANDARD_PREVIEW_RETRY_DELAY_SECONDS = 2]],
+'parâmetros rápidos de preview padrão')
+
+source = replaceOnce(source,
+[[        for attempt=1,MAX_ATTEMPTS do]],
+[[        for attempt=1,STANDARD_PREVIEW_MAX_ATTEMPTS do]],
+'tentativas de preview padrão')
+
+source = replaceOnce(source,
+[[            if attempt<MAX_ATTEMPTS and not sleepInterruptible(jobPath,job,RETRY_DELAY_SECONDS) then return false end]],
+[[            if attempt<STANDARD_PREVIEW_MAX_ATTEMPTS and not sleepInterruptible(jobPath,job,STANDARD_PREVIEW_RETRY_DELAY_SECONDS) then return false end]],
+'espera rápida de preview padrão')
+
 source = replaceOnce(source,
 [[local currentPath=photoPath(photo); if success then job.standard_previews_created=job.standard_previews_created+1; if currentPath then previewRetry.standard[currentPath]=nil end else job.standard_previews_failed=job.standard_previews_failed+1; if currentPath then previewRetry.standard[currentPath]=true end; plainLog('STANDARD_PREVIEW_GAVE_UP photo='..index..' error='..tostring(lastError)) end; savePreviewRetry()]],
-[[local currentPath=photoPath(photo); if success then job.standard_previews_created=job.standard_previews_created+1; if currentPath then if previewRetry.smart[currentPath] then previewRetry.standard[currentPath]=true; job.standard_previews_retry_deferred=(job.standard_previews_retry_deferred or 0)+1; plainLog('STANDARD_PREVIEW_DEFERRED_UNTIL_SMART path='..tostring(currentPath)) else previewRetry.standard[currentPath]=nil end end else job.standard_previews_failed=job.standard_previews_failed+1; if currentPath then previewRetry.standard[currentPath]=true end; plainLog('STANDARD_PREVIEW_GAVE_UP photo='..index..' error='..tostring(lastError)) end; savePreviewRetry()]],
-    'não limpar Standard por thumbnail de cache')
+[[local currentPath=photoPath(photo); if success then job.standard_previews_created=job.standard_previews_created+1; if currentPath then previewRetry.standard[currentPath]=nil end else job.standard_previews_failed=job.standard_previews_failed+1; if currentPath then previewRetry.standard[currentPath]=true end; plainLog('STANDARD_PREVIEW_GAVE_UP photo='..index..' error='..tostring(lastError)) end]],
+'persistência agrupada de preview padrão')
+
+source = replaceOnce(source,
+[[    job.standard_previews_status=job.standard_previews_failed>0 and 'partial' or 'completed'
+    return job.standard_previews_failed==0]],
+[[    savePreviewRetry()
+    job.standard_previews_status=job.standard_previews_failed>0 and 'partial' or 'completed'
+    return job.standard_previews_failed==0]],
+'salvar preview padrão uma vez')
 
 ]=]
 
@@ -92,7 +138,7 @@ io.open = function(path, mode)
         realFile:close()
         content = content:gsub('\r\n','\n'):gsub('\r','\n')
         local marker = "_G.import = function(moduleName)"
-        local first = string.find(content, marker, 1, true)
+        local first = string.find(content,marker,1,true)
         if not first then error('JobRunner55: marcador de injeção não encontrado') end
         content = string.sub(content,1,first-1) .. injection .. '\n' .. string.sub(content,first)
         local consumed=false
