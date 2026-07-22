@@ -129,8 +129,16 @@ end
 
 function Runner.runLoop(shouldStop)
     while not shouldStop() do
+        local firstStopCheck = true
         local ok, loopError = xpcall(function()
+            -- Executa exatamente uma iteração real do loop legado. A primeira
+            -- consulta permite a entrada; a segunda encerra a iteração depois
+            -- que heartbeat, claim e varredura da fila foram executados.
             originalRunLoop(function()
+                if firstStopCheck then
+                    firstStopCheck = false
+                    return false
+                end
                 return true
             end)
         end, errorTrace)
@@ -138,15 +146,12 @@ function Runner.runLoop(shouldStop)
         if not ok then
             _G.LRAutomaticLastError = tostring(loopError)
             appendEmergencyLog('RUN_LOOP_ITERATION_FAILED ' .. tostring(loopError))
-        end
-
-        if not shouldStop() then
-            LrTasks.sleep(1)
+            if not shouldStop() then LrTasks.sleep(1) end
         end
     end
 end
 
 Runner.engine_name = 'JobRunner'
-Runner.engine_version = '4.11.0-single-official-entrypoint-lr104'
+Runner.engine_version = '4.11.1-single-official-entrypoint-lr104'
 
 return Runner
