@@ -41,6 +41,7 @@ class JobStatus(StrEnum):
     PARTIAL = 'partial'
     FAILED = 'failed'
     CANCELLED = 'cancelled'
+    INTERRUPTED = 'interrupted'
 
 
 class SourceStatus(StrEnum):
@@ -114,7 +115,7 @@ class JobEvent(BaseModel):
 
 
 class ImportJob(BaseModel):
-    schema_version: int = 8
+    schema_version: int = 9
     job_id: str = Field(default_factory=lambda: f'job_{uuid4().hex}')
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -131,6 +132,10 @@ class ImportJob(BaseModel):
     current_source: str | None = None
     active_catalog_path: str | None = None
     error: str | None = None
+    runner_instance_id: str | None = None
+    runner_heartbeat_epoch: int | None = None
+    runner_heartbeat_at: str | None = None
+    interrupted_at: str | None = None
     preset_status: str = 'not_requested'
     preset_name_applied: str | None = None
     preset_applied_count: int = 0
