@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .automation_control import read_control
@@ -11,10 +12,12 @@ from .desktop_selective_cleanup import SelectiveCleanupDesktopApp
 
 
 class StableDesktopApp(SelectiveCleanupDesktopApp):
-    """Monitor responsivo com leitura em background e atualização incremental."""
+    """Monitor legível, responsivo e econômico em acessos ao disco."""
 
-    MONITOR_INTERVAL_MS = 750
-    CONTROL_REFRESH_SECONDS = 3.0
+    # O usuário não precisa de telemetria instantânea por foto. Dois segundos deixam
+    # a interface estável e reduzem bastante enumerações e stats na pasta de jobs.
+    MONITOR_INTERVAL_MS = 2000
+    CONTROL_REFRESH_SECONDS = 6.0
     STALE_WARNING_SECONDS = 120
 
     def __init__(self, config_path: str = "config.json") -> None:
@@ -25,25 +28,25 @@ class StableDesktopApp(SelectiveCleanupDesktopApp):
         self._last_control_snapshot: dict[str, Any] | None = None
         self._render_fingerprints: dict[str, tuple[Any, ...]] = {}
         self._row_fingerprints: dict[str, tuple[Any, ...]] = {}
+        self._display_percent: dict[str, int] = {}
         self._monitor_last_success = 0.0
         self._last_control_read = 0.0
         super().__init__(config_path)
-        self.title("LRAutomatic V4.9")
+        self.title("LRAutomatic V5.1")
         self._configure_progress_column()
 
     def _configure_progress_column(self) -> None:
         if not hasattr(self, "jobs_tree"):
             return
-        columns = ("created", "status", "progress", "folders", "imported", "summary")
+        columns = ("created", "status", "progress", "counts", "summary")
         if tuple(self.jobs_tree.cget("columns")) != columns:
             self.jobs_tree.configure(columns=columns)
         definitions = (
-            ("created", "Criada em", 125),
-            ("status", "Status", 115),
-            ("progress", "Etapa e progresso", 285),
-            ("folders", "Pastas", 60),
-            ("imported", "Fotos", 70),
-            ("summary", "Resultado", 260),
+            ("created", "Criada em", 120),
+            ("status", "Situação", 120),
+            ("progress", "O que está acontecendo", 315),
+            ("counts", "Quantidade", 245),
+            ("summary", "Resultado", 235),
         )
         for key, title, width in definitions:
             self.jobs_tree.heading(key, text=title)
@@ -51,7 +54,7 @@ class StableDesktopApp(SelectiveCleanupDesktopApp):
                 key,
                 width=width,
                 anchor="w",
-                stretch=key in {"progress", "summary"},
+                stretch=key in {"progress", "counts", "summary"},
             )
 
     @staticmethod
@@ -72,85 +75,88 @@ class StableDesktopApp(SelectiveCleanupDesktopApp):
 
     @staticmethod
     def _status_failed(value: Any) -> bool:
-        return str(value or "").lower() in {"failed", "error"}
+        return str(value or "").lower() in {"failed", "error", "failed_after_retries"}
 
-    def _job_stage_and_percent(self, job: Any) -> tuple[str, int]:
+    @staticmethod
+    def _requested(value: Any) -> bool:
+        return str(value or "").lower() not in {"", "none", "not_requested"}
+
+    @staticmethod
+    def _source_name(job: Any) -> str:
+        value = str(getattr(job, "current_source", "") or "").rstrip("/\\")
+        return Path(value).name if value else ""
+
+    def _raw_stage_and_percent(self, job: Any) -> tuple[str, int]:
+        """Calcula progresso em fases fixas; a porcentagem exibida é estabilizada depois."""
         status = str(job.status)
         if status == "queued":
-            return "Aguardando início", 0
+            return "Aguardando o Lightroom", 0
         if status in {"completed", "partial"}:
             return "Concluída", 100
         if status == "failed":
             return "Falhou", 100
         if status == "cancelled":
             return "Cancelada", 100
+        if status == "interrupted":
+            return "Interrompida", 100
 
         discovered = max(0, int(job.total_discovered or 0))
         imported = max(0, int(job.total_imported or 0))
         skipped = max(0, int(job.total_skipped or 0))
         failed = max(0, int(job.total_failed or 0))
         processed = imported + skipped + failed
+        source_name = self._source_name(job)
 
-        # Pesos dinâmicos: só reserva espaço para etapas realmente solicitadas.
-        requested_steps: list[tuple[str, str, int, int]] = []
-        if str(job.preset_status) != "not_requested":
-            requested_steps.append(("preset", "Aplicando preset", int(job.preset_applied_count or 0), max(imported, 1)))
-        if str(job.standard_previews_status) != "not_requested":
-            requested_steps.append((
-                "standard",
-                "Criando visualizações padrão",
-                int(job.standard_previews_created or 0),
-                max(imported, 1),
-            ))
-        if str(job.smart_previews_status) != "not_requested":
-            requested_steps.append((
-                "smart",
-                "Criando Smart Previews",
-                int(job.smart_previews_created or 0) + int(job.smart_previews_existed or 0),
-                max(imported, 1),
-            ))
-
-        post_weight = 10 * len(requested_steps)
-        import_weight = max(55, 90 - post_weight)
-        discovery_weight = 10
-
+        # Fases fixas: localizar 0–5, importar 5–75, preset 75–83,
+        # preview padrão 83–91, Smart Preview 91–98 e finalização 99.
         if discovered <= 0:
-            return "Descobrindo arquivos", 3
+            return "Procurando fotos nas pastas", 2
 
         if processed < discovered:
             ratio = min(1.0, processed / max(discovered, 1))
-            percent = discovery_weight + int(import_weight * ratio)
-            current_name = ""
-            if job.current_source:
-                current_name = str(job.current_source).rstrip("/\\").split("\\")[-1].split("/")[-1]
-            detail = f"Importando {processed}/{discovered}"
-            if current_name:
-                detail += f" • {current_name}"
-            return detail, min(percent, 94)
+            label = f"Importando fotos — {processed} de {discovered}"
+            if source_name:
+                label += f" • {source_name}"
+            return label, 5 + int(70 * ratio)
 
-        base = discovery_weight + import_weight
-        for index, (key, label, done, target) in enumerate(requested_steps):
-            if key == "preset":
-                state = job.preset_status
-            elif key == "standard":
-                state = job.standard_previews_status
-            else:
-                state = job.smart_previews_status
+        imported_target = max(imported, 1)
+        preset_status = getattr(job, "preset_status", "not_requested")
+        if self._requested(preset_status) and not self._status_done(preset_status):
+            done = max(0, int(getattr(job, "preset_applied_count", 0) or 0))
+            if self._status_failed(preset_status):
+                return "Preset concluído com falhas", 82
+            return f"Aplicando preset — {min(done, imported_target)} de {imported_target}", 75 + int(8 * min(1.0, done / imported_target))
 
-            if self._status_failed(state):
-                return f"{label} • com falhas", min(99, base + index * 10)
-            if self._status_done(state):
-                base += 10
-                continue
+        standard_status = getattr(job, "standard_previews_status", "not_requested")
+        if self._requested(standard_status) and not self._status_done(standard_status):
+            done = max(0, int(getattr(job, "standard_previews_created", 0) or 0))
+            if self._status_failed(standard_status):
+                return "Visualizações padrão concluídas com falhas", 90
+            return f"Criando visualizações padrão — {min(done, imported_target)} de {imported_target}", 83 + int(8 * min(1.0, done / imported_target))
 
-            ratio = min(1.0, done / max(target, 1))
-            percent = min(99, base + int(10 * ratio))
-            counter = f" {done}/{target}" if done else ""
-            return f"{label}{counter}", percent
+        smart_status = getattr(job, "smart_previews_status", "not_requested")
+        if self._requested(smart_status) and not self._status_done(smart_status):
+            done = max(0, int(getattr(job, "smart_previews_created", 0) or 0))
+            done += max(0, int(getattr(job, "smart_previews_existed", 0) or 0))
+            if self._status_failed(smart_status):
+                return "Smart Previews concluídos com falhas", 97
+            return f"Criando Smart Previews — {min(done, imported_target)} de {imported_target}", 91 + int(7 * min(1.0, done / imported_target))
 
-        # O Lightroom pode já ter terminado as etapas, mas ainda não ter gravado o
-        # status terminal no JSON. Nunca apresenta 100% antes da confirmação final.
-        return "Finalizando e confirmando resultado", 99
+        return "Finalizando e salvando o resultado", 99
+
+    def _job_stage_and_percent(self, job: Any) -> tuple[str, int]:
+        stage, raw_percent = self._raw_stage_and_percent(job)
+        job_id = str(job.job_id)
+        status = str(job.status)
+        if status == "queued":
+            stable = 0
+        elif status in {"completed", "partial", "failed", "cancelled", "interrupted"}:
+            stable = 100
+        else:
+            # Nunca deixa a porcentagem voltar, mesmo que o JSON revele uma etapa nova.
+            stable = max(self._display_percent.get(job_id, 0), min(raw_percent, 99))
+        self._display_percent[job_id] = stable
+        return stage, stable
 
     def _progress_label(self, job: Any) -> str:
         stage, percent = self._job_stage_and_percent(job)
@@ -161,15 +167,31 @@ class StableDesktopApp(SelectiveCleanupDesktopApp):
         if updated is not None:
             age = max(0, int(time.time() - updated))
             if age >= self.STALE_WARNING_SECONDS:
-                minutes, seconds = divmod(age, 60)
-                return f"⚠ {stage} • {percent}% • sem atualização há {minutes}m{seconds:02d}s"
+                minutes = max(1, age // 60)
+                return f"⚠ {stage} • {percent}% • sem avanço há {minutes} min"
         return f"{stage} • {percent}%"
 
     @staticmethod
+    def _counts_label(job: Any) -> str:
+        discovered = max(0, int(job.total_discovered or 0))
+        imported = max(0, int(job.total_imported or 0))
+        skipped = max(0, int(job.total_skipped or 0))
+        failed = max(0, int(job.total_failed or 0))
+        processed = imported + skipped + failed
+        if discovered <= 0:
+            return "Total ainda sendo contado"
+        parts = [f"{min(processed, discovered)}/{discovered} processadas", f"{imported} novas"]
+        if skipped:
+            parts.append(f"{skipped} já estavam no catálogo")
+        if failed:
+            parts.append(f"{failed} falharam")
+        return " • ".join(parts)
+
+    @staticmethod
     def _job_fingerprint(job: Any) -> tuple[Any, ...]:
+        # updated_at/heartbeat não entram: não redesenha detalhes só porque o relógio mudou.
         return (
             str(job.status),
-            job.updated_at,
             job.total_discovered,
             job.total_imported,
             job.total_skipped,
@@ -205,8 +227,7 @@ class StableDesktopApp(SelectiveCleanupDesktopApp):
             self._dt(job.created_at),
             STATUS_PT.get(str(job.status), str(job.status)),
             self._progress_label(job),
-            len(job.progress),
-            job.total_imported,
+            self._counts_label(job),
             self._result(job),
         )
 
@@ -267,6 +288,7 @@ class StableDesktopApp(SelectiveCleanupDesktopApp):
             self.jobs_tree.delete(item_id)
             self._row_fingerprints.pop(item_id, None)
             self._render_fingerprints.pop(item_id, None)
+            self._display_percent.pop(item_id, None)
 
         for index, job in enumerate(visible):
             item_id = job.job_id
@@ -306,7 +328,7 @@ class StableDesktopApp(SelectiveCleanupDesktopApp):
                 self._render_fingerprints[target] = fingerprint
 
         self._apply_control_snapshot(control, jobs)
-        self.monitor_state.set("Atualizado em tempo real")
+        self.monitor_state.set("Atualização leve • a cada 2 s")
         if not silent:
             self.status.set(f"Histórico atualizado: {len(jobs)} tarefa(s).")
 
