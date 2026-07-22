@@ -4,7 +4,7 @@ local LrPathUtils = import 'LrPathUtils'
 local Json = require 'Json'
 
 local Organizer = {}
-local ORGANIZATION_VERSION = 2
+local ORGANIZATION_VERSION = 3
 
 local function homePath()
     local home = LrPathUtils.getStandardFilePath('home')
@@ -79,6 +79,19 @@ local function optionalName(value)
     return text
 end
 
+local function hourName(value)
+    local text = cleanName(value, '')
+    local hour, minute = string.match(text, '(%d%d?):(%d%d)')
+    if hour and minute then
+        return string.format('%02dh%02d', tonumber(hour), tonumber(minute))
+    end
+    hour, minute = string.match(text, '(%d%d?)h(%d%d)')
+    if hour and minute then
+        return string.format('%02dh%02d', tonumber(hour), tonumber(minute))
+    end
+    return 'Sem horário'
+end
+
 local function appendEvent(job, stage, title, detail, level)
     job.events = job.events or {}
     table.insert(job.events, {
@@ -103,22 +116,23 @@ local function withWrite(catalog, actionName, fn)
     return ran and not timedOut and (status == nil or status == 'executed')
 end
 
-local function findCollectionSet(catalog, name)
-    for _, set in ipairs(catalog:getChildCollectionSets() or {}) do
+local function findCollectionSet(catalog, parent, name)
+    local children = parent and parent:getChildCollectionSets() or catalog:getChildCollectionSets()
+    for _, set in ipairs(children or {}) do
         if set:getName() == name then return set end
     end
     return nil
 end
 
-local function ensureCollectionSet(catalog, name)
-    local existing = findCollectionSet(catalog, name)
+local function ensureCollectionSet(catalog, parent, name)
+    local existing = findCollectionSet(catalog, parent, name)
     if existing then return existing, false end
     local created = nil
     local ok = withWrite(catalog, 'LRAutomatic: criar conjunto ' .. name, function()
-        created = catalog:createCollectionSet(name, nil, true)
+        created = catalog:createCollectionSet(name, parent, true)
     end)
     if not ok then return nil, false end
-    return created or findCollectionSet(catalog, name), true
+    return created or findCollectionSet(catalog, parent, name), true
 end
 
 local function findCollection(parent, name)
@@ -175,21 +189,29 @@ local function collectPhotos(catalog, source, request)
     return photos
 end
 
-local function addToTree(catalog, setName, collectionName, photos, counters)
-    local set, setWasCreated = ensureCollectionSet(catalog, setName)
-    if not set then
-        counters.failures = counters.failures + 1
-        return
+local function ensurePath(catalog, names, counters)
+    local parent = nil
+    for _, name in ipairs(names) do
+        local set, created = ensureCollectionSet(catalog, parent, name)
+        if not set then
+            counters.failures = counters.failures + 1
+            return nil
+        end
+        if created then counters.setsCreated = counters.setsCreated + 1 end
+        parent = set
     end
-    if setWasCreated then counters.setsCreated = counters.setsCreated + 1 end
+    return parent
+end
 
-    local collection, collectionWasCreated = ensureCollection(catalog, set, collectionName)
+local function addToHierarchy(catalog, pathNames, collectionName, photos, counters)
+    local parent = ensurePath(catalog, pathNames, counters)
+    if not parent then return end
+    local collection, created = ensureCollection(catalog, parent, collectionName)
     if not collection then
         counters.failures = counters.failures + 1
         return
     end
-    if collectionWasCreated then counters.collectionsCreated = counters.collectionsCreated + 1 end
-
+    if created then counters.collectionsCreated = counters.collectionsCreated + 1 end
     if #photos > 0 then
         local ok = withWrite(catalog, 'LRAutomatic: organizar ' .. collectionName, function()
             collection:addPhotos(photos)
@@ -216,7 +238,6 @@ end
 local function organizeJob(path, job)
     local request = job.request or {}
     if not needsOrganization(job, request) then return false end
-
     local status = tostring(job.status or '')
     if status ~= 'completed' and status ~= 'partial' then return false end
 
@@ -239,21 +260,23 @@ local function organizeJob(path, job)
         clientSkipped = 0,
     }
 
+    local rootName = cleanName(request.collection_set, 'Home Picz')
     for _, source in ipairs(request.sources or {}) do
         local photos = collectPhotos(catalog, source, request)
         local workId = cleanName(source.work_id, cleanName(LrPathUtils.leafName(source.path or ''), 'Sem ID'))
+        local collectionName = cleanName(source.collection, workId)
+        local scheduledHour = hourName(source.scheduled_at)
 
         if request.organize_collections_by_photographer == true then
             local photographer = cleanName(source.photographer, 'Sem fotógrafo')
-            local photographerCollection = cleanName(source.collection, workId)
-            addToTree(catalog, photographer, photographerCollection, photos, counters)
+            addToHierarchy(catalog, {rootName, 'Fotógrafos', photographer, scheduledHour}, collectionName, photos, counters)
             counters.photographerTrees = counters.photographerTrees + 1
         end
 
         if request.organize_collections_by_client == true then
             local client = optionalName(source.client)
             if client then
-                addToTree(catalog, client, workId, photos, counters)
+                addToHierarchy(catalog, {rootName, 'Clientes', client, scheduledHour}, collectionName, photos, counters)
                 counters.clientTrees = counters.clientTrees + 1
             else
                 counters.clientSkipped = counters.clientSkipped + 1
@@ -269,8 +292,9 @@ local function organizeJob(path, job)
     appendEvent(
         job,
         'collections',
-        counters.failures > 0 and 'Coleções organizadas com ressalvas' or 'Coleções organizadas ao concluir o job',
-        'Execução única; conjuntos novos: ' .. counters.setsCreated
+        counters.failures > 0 and 'Coleções organizadas com ressalvas' or 'Coleções organizadas na nova estrutura',
+        'Estrutura: Home Picz - DATA > Fotógrafos/Clientes > Nome > Horário > ID - Rua; conjuntos novos: '
+            .. counters.setsCreated
             .. '; coleções novas: ' .. counters.collectionsCreated
             .. '; vínculos de fotos: ' .. counters.photosAdded
             .. '; árvores por fotógrafo: ' .. counters.photographerTrees
