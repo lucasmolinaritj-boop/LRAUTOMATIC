@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -19,19 +20,38 @@ class JobStore:
     MISSING_GRACE_REFRESHES = 12
     HOME_PICZ_COLLECTION_PREFIX = "Home Picz - "
     ACTIVE_STATUSES = {"queued", "running"}
+    TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled", "interrupted"}
     STALE_RUNNING_SECONDS = 15 * 60
     CREATE_LOCK_STALE_SECONDS = 60
+    HISTORY_LIMIT = 150
+    HISTORY_REFRESH_SECONDS = 20.0
+    MAX_INLINE_EVENTS = 80
 
     def __init__(self, settings: Settings):
         self.settings = settings
         self.settings.ensure_dirs()
+        self.history_dir.mkdir(parents=True, exist_ok=True)
         self._last_good_jobs: dict[str, ImportJob] = {}
         self._missing_refreshes: dict[str, int] = {}
         self._file_signatures: dict[str, tuple[int, int]] = {}
+        self._history_cache: list[ImportJob] = []
+        self._history_last_read = 0.0
         self._lock = threading.RLock()
+        self._archive_terminal_jobs()
+
+    @property
+    def history_dir(self) -> Path:
+        return self.settings.jobs_dir.parent / "jobs_history"
 
     def _job_path(self, job_id: str) -> Path:
         return self.settings.jobs_dir / f"{job_id}.json"
+
+    def _history_job_path(self, job_id: str) -> Path | None:
+        try:
+            matches = sorted(self.history_dir.glob(f"*/{job_id}.json"), reverse=True)
+        except OSError:
+            return None
+        return matches[0] if matches else None
 
     @property
     def _create_lock_path(self) -> Path:
@@ -86,6 +106,72 @@ class JobStore:
         if job.runner_heartbeat_epoch:
             return float(job.runner_heartbeat_epoch)
         return self._parse_iso_epoch(job.runner_heartbeat_at) or self._parse_iso_epoch(job.updated_at)
+
+    @staticmethod
+    def _archive_month(job: ImportJob) -> str:
+        value = job.finished_at or job.updated_at or job.created_at
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.strftime("%Y-%m")
+        except (TypeError, ValueError):
+            return datetime.now().strftime("%Y-%m")
+
+    def _compact_events(self, job: ImportJob) -> None:
+        events = list(job.events or [])
+        if len(events) <= self.MAX_INLINE_EVENTS:
+            return
+        important = []
+        for event in events:
+            level = str(getattr(event, "level", "info") or "info").lower()
+            stage = str(getattr(event, "stage", "") or "").lower()
+            if level in {"warning", "error", "critical"} or stage in {
+                "queue", "start", "source", "preset", "standard_previews",
+                "smart_previews", "cancelled", "failed", "completed", "interrupted",
+            }:
+                important.append(event)
+        keep = important[-40:] + events[-40:]
+        deduped = []
+        seen = set()
+        for event in keep:
+            key = (
+                str(getattr(event, "at", "")),
+                str(getattr(event, "stage", "")),
+                str(getattr(event, "title", "")),
+                str(getattr(event, "detail", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(event)
+        job.events = deduped[-self.MAX_INLINE_EVENTS:]
+
+    def _archive_job_file(self, path: Path, job: ImportJob) -> Path:
+        destination_dir = self.history_dir / self._archive_month(job)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / path.name
+        if path.resolve() == destination.resolve():
+            return destination
+        try:
+            os.replace(path, destination)
+        except OSError:
+            shutil.copy2(path, destination)
+            path.unlink(missing_ok=True)
+        self._history_last_read = 0.0
+        return destination
+
+    def _archive_terminal_jobs(self) -> None:
+        try:
+            paths = list(self.settings.jobs_dir.glob("job_*.json"))
+        except OSError:
+            return
+        for path in paths:
+            job = self._read_job_with_retry(path)
+            if job is None or str(job.status) not in self.TERMINAL_STATUSES:
+                continue
+            try:
+                self._archive_job_file(path, job)
+            except OSError:
+                continue
 
     def recover_stale_running_jobs(self, now_epoch: float | None = None) -> list[str]:
         now_epoch = now_epoch or time.time()
@@ -182,8 +268,20 @@ class JobStore:
     def save(self, job: ImportJob) -> None:
         with self._lock:
             job.touch()
-            path = self._job_path(job.job_id)
-            self._atomic_write(path, job.model_dump(mode="json"))
+            self._compact_events(job)
+            active_path = self._job_path(job.job_id)
+            if str(job.status) in self.TERMINAL_STATUSES:
+                destination = self.history_dir / self._archive_month(job) / active_path.name
+                self._atomic_write(destination, job.model_dump(mode="json"))
+                try:
+                    active_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                path = destination
+                self._history_last_read = 0.0
+            else:
+                path = active_path
+                self._atomic_write(path, job.model_dump(mode="json"))
             self._last_good_jobs[job.job_id] = job
             signature = self._signature(path)
             if signature is not None:
@@ -208,6 +306,8 @@ class JobStore:
     def get(self, job_id: str) -> ImportJob:
         with self._lock:
             path = self._job_path(job_id)
+            if not path.exists():
+                path = self._history_job_path(job_id) or path
             signature = self._signature(path)
             cached = self._last_good_jobs.get(job_id)
             if cached is not None and signature is not None and self._file_signatures.get(job_id) == signature:
@@ -236,8 +336,30 @@ class JobStore:
                     jobs.append(job)
             return sorted(jobs, key=lambda job: job.created_at, reverse=True)
 
+    def _load_history(self, force: bool = False) -> list[ImportJob]:
+        now = time.monotonic()
+        if not force and self._history_cache and now - self._history_last_read < self.HISTORY_REFRESH_SECONDS:
+            return self._history_cache
+        try:
+            paths = sorted(
+                self.history_dir.glob("*/job_*.json"),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )[: self.HISTORY_LIMIT]
+        except OSError:
+            return self._history_cache
+        jobs = []
+        for path in paths:
+            job = self._read_job_with_retry(path)
+            if job is not None:
+                jobs.append(job)
+        self._history_cache = sorted(jobs, key=lambda job: job.created_at, reverse=True)
+        self._history_last_read = now
+        return self._history_cache
+
     def list(self) -> list[ImportJob]:
         with self._lock:
+            self._archive_terminal_jobs()
             current: dict[str, ImportJob] = {}
             try:
                 paths = list(self.settings.jobs_dir.glob("job_*.json"))
@@ -246,42 +368,35 @@ class JobStore:
                 paths = []
                 listing_ok = False
 
-            if not listing_ok:
-                return sorted(self._last_good_jobs.values(), key=lambda job: job.created_at, reverse=True)
+            if listing_ok:
+                for path in paths:
+                    job_id = path.stem
+                    signature = self._signature(path)
+                    cached = self._last_good_jobs.get(job_id)
+                    if cached is not None and signature is not None and self._file_signatures.get(job_id) == signature:
+                        job = cached
+                    else:
+                        job = self._read_job_with_retry(path) or cached
+                    if job is not None:
+                        current[job.job_id] = job
+                        self._last_good_jobs[job.job_id] = job
+                        if signature is not None:
+                            self._file_signatures[job.job_id] = signature
+                        self._missing_refreshes.pop(job.job_id, None)
+            else:
+                for job_id, job in self._last_good_jobs.items():
+                    if str(job.status) in self.ACTIVE_STATUSES:
+                        current[job_id] = job
 
-            for path in paths:
-                job_id = path.stem
-                signature = self._signature(path)
-                cached = self._last_good_jobs.get(job_id)
-                if cached is not None and signature is not None and self._file_signatures.get(job_id) == signature:
-                    job = cached
-                else:
-                    job = self._read_job_with_retry(path) or cached
-                if job is not None:
-                    current[job.job_id] = job
-                    self._last_good_jobs[job.job_id] = job
-                    if signature is not None:
-                        self._file_signatures[job.job_id] = signature
-                    self._missing_refreshes.pop(job.job_id, None)
-
-            for job_id, cached in list(self._last_good_jobs.items()):
-                if job_id in current:
-                    continue
-                misses = self._missing_refreshes.get(job_id, 0) + 1
-                self._missing_refreshes[job_id] = misses
-                if misses <= self.MISSING_GRACE_REFRESHES:
-                    current[job_id] = cached
-                else:
-                    self._last_good_jobs.pop(job_id, None)
-                    self._file_signatures.pop(job_id, None)
-                    self._missing_refreshes.pop(job_id, None)
+            for job in self._load_history():
+                current.setdefault(job.job_id, job)
 
             return sorted(current.values(), key=lambda job: job.created_at, reverse=True)
 
     def cancel(self, job_id: str) -> ImportJob:
         with self._lock:
             job = self.get(job_id)
-            if str(job.status) not in {"completed", "failed", "cancelled", "interrupted"}:
+            if str(job.status) not in self.TERMINAL_STATUSES:
                 job.status = "cancelled"
                 job.finished_at = utc_now()
                 job.add_event("cancelled", "Tarefa cancelada pelo usuário", level="warning")
