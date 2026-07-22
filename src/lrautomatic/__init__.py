@@ -9,9 +9,6 @@ def install_homepicz_queue_guard() -> None:
     except Exception:
         return
 
-    # Corrige uma regressão no scheduler: bool(...).startswith(...) sempre falha,
-    # pois bool() devolve True/False. A função segura mantém compatibilidade com
-    # jobs antigos e valores ausentes ou inesperados em collection_set.
     def safe_is_homepicz_job(job) -> bool:
         request = getattr(job, "request", None)
         collection_set = getattr(request, "collection_set", None)
@@ -34,9 +31,6 @@ def install_homepicz_queue_guard() -> None:
         return
 
     def guarded_wait(self, cycle_finished_at):
-        # O intervalo entre jobs é decidido pela guarda usando finished_at.
-        # Durante a espera, qualquer alteração no arquivo de configuração recalcula
-        # imediatamente o próximo polling. Não exige reinstalação nem reinício do serviço.
         import time
 
         wait_started = time.monotonic()
@@ -61,3 +55,10 @@ def install_homepicz_queue_guard() -> None:
 
 
 install_homepicz_queue_guard()
+
+try:
+    from .homepicz_editor_features import install_homepicz_editor_features
+
+    install_homepicz_editor_features()
+except Exception:
+    pass
