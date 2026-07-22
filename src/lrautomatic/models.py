@@ -125,10 +125,18 @@ class JobEvent(BaseModel):
     level: str = 'info'
 
 
+class BadFileRecord(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
+    path: str
+    reason: str
+    at: str = Field(default_factory=utc_now)
+
+
 class ImportJob(BaseModel):
     model_config = ConfigDict(extra='allow')
 
-    schema_version: int = 10
+    schema_version: int = 11
     job_id: str = Field(default_factory=lambda: f'job_{uuid4().hex}')
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -153,6 +161,9 @@ class ImportJob(BaseModel):
     interrupted_at: str | None = None
     import_attempts_total: int = 0
     inventory_reused_count: int = 0
+    bad_files: list[BadFileRecord] = Field(default_factory=list)
+    bad_files_count: int = 0
+    completed_with_file_errors: bool = False
     preset_status: str = 'not_requested'
     preset_name_applied: str | None = None
     preset_applied_count: int = 0
