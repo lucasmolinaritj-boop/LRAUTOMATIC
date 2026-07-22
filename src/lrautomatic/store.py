@@ -15,6 +15,8 @@ class JobStore:
     READ_RETRIES = 3
     READ_RETRY_DELAY_SECONDS = 0.05
     MISSING_GRACE_REFRESHES = 12
+    HOME_PICZ_COLLECTION_PREFIX = "Home Picz - "
+    ACTIVE_STATUSES = {"queued", "running"}
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -52,36 +54,57 @@ class JobStore:
         except OSError:
             return None
 
-    def create(self, request: ImportJobRequest) -> ImportJob:
-        progress = [
-            SourceProgress(
-                path=source.path,
-                collection=source.collection or Path(source.path).name,
-                discovered=max(0, int(source.expected_count or 0)),
-            )
-            for source in request.sources
-        ]
-        total_discovered = sum(item.discovered for item in progress)
-        job = ImportJob(request=request, progress=progress, total_discovered=total_discovered)
-        if request.organize_collections_by_photographer or request.organize_collections_by_client:
-            job.collections_status = "requested"
-            job.collections_run_once_token = job.job_id
-        if request.build_standard_previews:
-            job.standard_previews_status = "requested"
-        if request.build_smart_previews:
-            job.smart_previews_status = "requested"
-        if request.develop_preset_name or request.develop_preset_uuid:
-            job.preset_status = "requested"
-        job.add_event(
-            "queue",
-            "Tarefa criada",
-            (
-                f"{len(request.sources)} pasta(s) adicionada(s) à fila; "
-                f"total fechado em {total_discovered} foto(s) antes do início."
-            ),
+    @classmethod
+    def _is_homepicz_request(cls, request: ImportJobRequest) -> bool:
+        return str(request.collection_set or "").startswith(cls.HOME_PICZ_COLLECTION_PREFIX)
+
+    @classmethod
+    def _is_active_homepicz_job(cls, job: ImportJob) -> bool:
+        return (
+            str(job.request.collection_set or "").startswith(cls.HOME_PICZ_COLLECTION_PREFIX)
+            and str(job.status) in cls.ACTIVE_STATUSES
         )
-        self.save(job)
-        return job
+
+    def create(self, request: ImportJobRequest) -> ImportJob:
+        with self._lock:
+            # Política de fila simples: existe no máximo um job Home Picz ativo.
+            # O scheduler pode continuar verificando periodicamente, mas qualquer
+            # tentativa de criar outro job enquanto houver queued/running reutiliza
+            # o job atual. O próximo só nasce depois que a fila ativa ficar vazia.
+            if self._is_homepicz_request(request):
+                active_jobs = [job for job in self.list() if self._is_active_homepicz_job(job)]
+                if active_jobs:
+                    return min(active_jobs, key=lambda job: job.created_at)
+
+            progress = [
+                SourceProgress(
+                    path=source.path,
+                    collection=source.collection or Path(source.path).name,
+                    discovered=max(0, int(source.expected_count or 0)),
+                )
+                for source in request.sources
+            ]
+            total_discovered = sum(item.discovered for item in progress)
+            job = ImportJob(request=request, progress=progress, total_discovered=total_discovered)
+            if request.organize_collections_by_photographer or request.organize_collections_by_client:
+                job.collections_status = "requested"
+                job.collections_run_once_token = job.job_id
+            if request.build_standard_previews:
+                job.standard_previews_status = "requested"
+            if request.build_smart_previews:
+                job.smart_previews_status = "requested"
+            if request.develop_preset_name or request.develop_preset_uuid:
+                job.preset_status = "requested"
+            job.add_event(
+                "queue",
+                "Tarefa criada",
+                (
+                    f"{len(request.sources)} pasta(s) adicionada(s) à fila; "
+                    f"total fechado em {total_discovered} foto(s) antes do início."
+                ),
+            )
+            self.save(job)
+            return job
 
     def save(self, job: ImportJob) -> None:
         with self._lock:
