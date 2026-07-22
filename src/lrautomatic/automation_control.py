@@ -88,9 +88,9 @@ def set_paused(settings: Any, paused: bool, *, updated_by: str = "monitor") -> d
     value["paused"] = bool(paused)
     value["updated_by"] = updated_by
     value["message"] = (
-        "Automação pausada; jobs continuam sendo criados, mas nenhum novo job será iniciado."
+        "Automação totalmente pausada: sem consultas, varreduras, novos jobs ou abertura do Lightroom."
         if paused
-        else "Automação ativa"
+        else "Automação ativa; checagem imediata solicitada."
     )
     if paused:
         _write_flag(
@@ -107,7 +107,7 @@ def request_force_next(settings: Any, *, updated_by: str = "monitor") -> dict[st
     value["force_next_requested"] = True
     value["force_requested_at"] = datetime.now().isoformat(timespec="seconds")
     value["updated_by"] = updated_by
-    value["message"] = "Próximo job solicitado; aguardando a tarefa atual terminar."
+    value["message"] = "Próximo job solicitado; um único ciclo poderá rodar mesmo com a automação pausada."
     _write_flag(
         force_once_flag_path(settings),
         f"requested_at={value['force_requested_at']}\nupdated_by={updated_by}\n",
