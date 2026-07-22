@@ -20,6 +20,30 @@ source = replaceOnce(source,
     "job.preset_candidate_count=#importedPhotos; job.preset_skipped_existing_count=job.total_skipped or 0; local presetOk=applyPreset(catalog,importedPhotos,job,jobPath); safeWriteJob(jobPath,job)",
     'auditoria de isolamento do preset')
 
+-- Durante esperas longas, cancelamento continua sendo verificado a cada segundo,
+-- porém heartbeat/claim e JSON são gravados apenas a cada 5 segundos.
+source = replaceOnce(source,
+    "        updateClaim(job.job_id)\n        safeWriteJob(jobPath,job)\n        LrTasks.sleep(1)",
+    "        if (_ % 5)==0 or _==seconds then updateClaim(job.job_id); safeWriteJob(jobPath,job) end\n        LrTasks.sleep(1)",
+    'heartbeat agrupado durante espera')
+
+-- Reaproveita a lista descoberta em uma retomada quando todos os arquivos ainda
+-- existem. Se qualquer item sumiu, faz uma varredura nova e atualiza o snapshot.
+source = replaceOnce(source,
+    "local function collectFiles(folder,recursive,allowed)\n    if not folder or folder=='' then return {},'pasta de origem vazia' end",
+    "local function collectFiles(folder,recursive,allowed,cachedFiles)\n    if type(cachedFiles)=='table' and #cachedFiles>0 then\n        local valid=true\n        for _,cachedPath in ipairs(cachedFiles) do if not LrFileUtils.exists(cachedPath) or not allowed[normalizedExtension(cachedPath)] then valid=false; break end end\n        if valid then return cachedFiles,nil,true end\n    end\n    if not folder or folder=='' then return {},'pasta de origem vazia' end",
+    'inventário persistente de origem')
+
+source = replaceOnce(source,
+    "    return result,nil\nend\n\nlocal function refreshTotals(job)",
+    "    return result,nil,false\nend\n\nlocal function refreshTotals(job)",
+    'retorno de cache do inventário')
+
+source = replaceOnce(source,
+    "local files,scanError=collectFiles(source.path,source.recursive==true,allowed); progress.discovered=#files; progress.status=scanError and 'failed' or 'running'; progress.error=scanError",
+    "local files,scanError,reusedInventory=collectFiles(source.path,source.recursive==true,allowed,progress.discovered_files); progress.discovered=#files; progress.status=scanError and 'failed' or 'running'; progress.error=scanError; if not scanError and not reusedInventory then progress.discovered_files=files; progress.scan_completed=true; progress.scan_completed_at=timestamp() end; job.inventory_reused_count=(job.inventory_reused_count or 0)+(reusedInventory and 1 or 0)",
+    'uso do inventário persistente')
+
 -- Persistência em lote para todos os resultados. A interface não precisa de uma
 -- gravação por foto: salva a cada 10 itens ou 2 segundos e sempre ao fechar a pasta.
 source = replaceOnce(source,
