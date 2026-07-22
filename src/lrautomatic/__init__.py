@@ -69,3 +69,10 @@ try:
     install_raw_creation_time()
 except Exception:
     pass
+
+try:
+    from .homepicz_runtime_responsiveness import install_homepicz_runtime_responsiveness
+
+    install_homepicz_runtime_responsiveness()
+except Exception:
+    pass
