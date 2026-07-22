@@ -5,7 +5,6 @@
 -- temporária e não devem ser referenciadas por Init.lua ou outros módulos.
 local LrFileUtils = import 'LrFileUtils'
 local LrPathUtils = import 'LrPathUtils'
-local LrTasks = import 'LrTasks'
 
 local Runner = require 'JobRunner57'
 local CollectionOrganizer = require 'CollectionOrganizer'
@@ -46,112 +45,33 @@ local function consumeForceOnce()
     return true
 end
 
-local function errorTrace(err)
-    local message = tostring(err or 'erro desconhecido')
-    if debug and debug.traceback then
-        return debug.traceback(message, 2)
-    end
-    return message
-end
-
-local function appendEmergencyLog(message)
-    pcall(function()
-        local logDir = LrPathUtils.child(
-            LrPathUtils.child(
-                LrPathUtils.child(
-                    LrPathUtils.child(homePath(), 'AppData'),
-                    'Local'
-                ),
-                'LRAutomatic'
-            ),
-            'logs'
-        )
-        LrFileUtils.createAllDirectories(logDir)
-        local path = LrPathUtils.child(logDir, 'plugin-emergency.log')
-        local file = io.open(path, 'ab')
-        if file then
-            file:write(os.date('!%Y-%m-%dT%H:%M:%SZ') .. ' ' .. tostring(message) .. '\n')
-            file:flush()
-            file:close()
-        end
-    end)
-end
-
-local function protectedProcessQueuedOnce()
-    local ok, processedOrError = xpcall(function()
-        return originalProcessQueuedOnce()
-    end, errorTrace)
-
-    if ok then
-        _G.LRAutomaticLastError = nil
-        return processedOrError or 0
-    end
-
-    _G.LRAutomaticLastError = tostring(processedOrError)
-    appendEmergencyLog('PROCESS_QUEUED_ONCE_FAILED ' .. tostring(processedOrError))
-    return 0
-end
-
 function Runner.processQueuedOnce()
-    local organizerOk, organizerError = xpcall(function()
-        CollectionOrganizer.processOnce()
-    end, errorTrace)
-    if not organizerOk then
-        _G.LRAutomaticLastError = tostring(organizerError)
-        appendEmergencyLog('COLLECTION_ORGANIZER_BEFORE_FAILED ' .. tostring(organizerError))
-    end
+    -- Não envolver este fluxo em pcall/xpcall: as APIs do Lightroom e
+    -- withWriteAccessDo podem fazer yield, algo incompatível com pcall no Lua 5.1.
+    CollectionOrganizer.processOnce()
 
     if LrFileUtils.exists(pauseFlagPath()) then
         if consumeForceOnce() then
-            local processed = protectedProcessQueuedOnce()
-            local afterOk, afterError = xpcall(function()
-                CollectionOrganizer.processOnce()
-            end, errorTrace)
-            if not afterOk then
-                _G.LRAutomaticLastError = tostring(afterError)
-                appendEmergencyLog('COLLECTION_ORGANIZER_AFTER_FAILED ' .. tostring(afterError))
-            end
+            local processed = originalProcessQueuedOnce()
+            CollectionOrganizer.processOnce()
             return processed
         end
         return 0
     end
 
-    local processed = protectedProcessQueuedOnce()
-    local afterOk, afterError = xpcall(function()
-        CollectionOrganizer.processOnce()
-    end, errorTrace)
-    if not afterOk then
-        _G.LRAutomaticLastError = tostring(afterError)
-        appendEmergencyLog('COLLECTION_ORGANIZER_AFTER_FAILED ' .. tostring(afterError))
-    end
+    local processed = originalProcessQueuedOnce()
+    CollectionOrganizer.processOnce()
     return processed
 end
 
 function Runner.runLoop(shouldStop)
-    while not shouldStop() do
-        local firstStopCheck = true
-        local ok, loopError = xpcall(function()
-            -- Executa exatamente uma iteração real do loop legado. A primeira
-            -- consulta permite a entrada; a segunda encerra a iteração depois
-            -- que heartbeat, claim e varredura da fila foram executados.
-            originalRunLoop(function()
-                if firstStopCheck then
-                    firstStopCheck = false
-                    return false
-                end
-                return true
-            end)
-        end, errorTrace)
-
-        if not ok then
-            _G.LRAutomaticLastError = tostring(loopError)
-            appendEmergencyLog('RUN_LOOP_ITERATION_FAILED ' .. tostring(loopError))
-            if not shouldStop() then LrTasks.sleep(1) end
-        end
-    end
+    -- O JobRunner57 já fornece o loop direto e contínuo, sem worker filho.
+    -- Repassar a condição real de encerramento evita tanto o loop que não inicia
+    -- quanto wrappers pcall/xpcall incompatíveis com operações que fazem yield.
+    return originalRunLoop(shouldStop)
 end
 
 Runner.engine_name = 'JobRunner'
-Runner.engine_version = '4.11.1-single-official-entrypoint-lr104'
+Runner.engine_version = '4.11.2-single-official-entrypoint-lr104'
 
 return Runner
