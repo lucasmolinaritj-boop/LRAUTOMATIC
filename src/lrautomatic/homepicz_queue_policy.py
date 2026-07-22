@@ -59,3 +59,9 @@ def was_newly_created(job: ImportJob, request_sources: list[str]) -> bool:
     job_sources = [str(Path(source.path)) for source in job.request.sources]
     normalized_requested = [str(Path(path)) for path in request_sources]
     return job_sources == normalized_requested and str(job.status) == "queued"
+
+
+def preflight(store: JobStore, prefix: str = "Home Picz - ") -> tuple[list[ImportJob], list[str], list[ImportJob]]:
+    jobs, recovered = strict_jobs(store)
+    active = active_homepicz_jobs(jobs, prefix)
+    return jobs, recovered, active
