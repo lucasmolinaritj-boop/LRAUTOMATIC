@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import homepicz_scheduler
 from .config import Settings
-from .session_agent import run_forever
+from .session_agent_responsive import run_forever_responsive
 
 
 FETCH_ATTEMPTS = 4
@@ -62,10 +62,19 @@ def _fetch_work_items_with_retry(
 
 homepicz_scheduler._fetch_work_items = _fetch_work_items_with_retry
 
+# A atribuição acima substitui o fetcher. Reinstala o filtro por editor sobre a
+# versão com retry para que "importar apenas pertencentes a você" continue valendo.
+try:
+    from .homepicz_editor_features import install_homepicz_editor_features
+
+    install_homepicz_editor_features()
+except Exception:
+    pass
+
 
 def main() -> None:
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("config.json")
-    run_forever(config_path)
+    run_forever_responsive(config_path)
 
 
 if __name__ == "__main__":
