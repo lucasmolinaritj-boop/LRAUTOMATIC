@@ -79,6 +79,7 @@ class RawCalendarDesktopApp(StableDesktopApp):
     def __init__(self, config_path: str = "config.json") -> None:
         super().__init__(config_path)
         self.title("LRAutomatic V5.0")
+        self._stabilize_job_monitor_widgets()
         self.raw_inventory_date = current_import_window(self.settings).start
         self.raw_calendar_button = ttk.Button(
             self.inventory_button.master,
@@ -87,6 +88,41 @@ class RawCalendarDesktopApp(StableDesktopApp):
             command=self._open_raw_calendar,
         )
         self.raw_calendar_button.grid(row=0, column=3, padx=(6, 0))
+
+    def _stabilize_job_monitor_widgets(self) -> None:
+        """Evita repintura desnecessária e torna os detalhes realmente roláveis."""
+        if hasattr(self, "jobs_tree"):
+            original_tag_configure = self.jobs_tree.tag_configure
+            applied_tag_styles: dict[str, dict[str, object]] = {}
+
+            def stable_tag_configure(tag_name: str, **options):
+                if applied_tag_styles.get(tag_name) == options:
+                    return None
+                applied_tag_styles[tag_name] = dict(options)
+                return original_tag_configure(tag_name, **options)
+
+            self.jobs_tree.tag_configure = stable_tag_configure
+
+        if hasattr(self, "detail_text"):
+            detail_parent = self.detail_text.master
+            detail_parent.columnconfigure(0, weight=1)
+            detail_parent.columnconfigure(1, weight=0)
+            self.detail_scrollbar = ttk.Scrollbar(
+                detail_parent,
+                orient="vertical",
+                command=self.detail_text.yview,
+            )
+            self.detail_scrollbar.grid(row=3, column=1, sticky="ns")
+            self.detail_text.configure(yscrollcommand=self.detail_scrollbar.set)
+
+    def _render(self, job) -> None:
+        """Atualiza os detalhes sem jogar a leitura de volta para o início."""
+        same_job = getattr(self, "selected_job_id", None) == job.job_id
+        previous_view = self.detail_text.yview() if same_job and hasattr(self, "detail_text") else None
+        super()._render(job)
+        if previous_view:
+            first_fraction = previous_view[0]
+            self.after_idle(lambda value=first_fraction: self.detail_text.yview_moveto(value))
 
     def _raw_calendar_button_text(self) -> str:
         return f"📅 {self.raw_inventory_date:%d/%m/%Y}"
