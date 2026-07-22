@@ -1,17 +1,19 @@
 -- Otimizações de desempenho sobre o JobRunner54.
--- Mantém toda a cadeia anterior intacta e injeta cache do catálogo por job.
+-- Mantém toda a cadeia anterior intacta e injeta cache persistente do catálogo
+-- durante toda a sessão do Lightroom.
 local LrPathUtils = import 'LrPathUtils'
 
 local originalOpen = io.open
 local targetPath = LrPathUtils.child(_PLUGIN.path, 'JobRunner51.lua')
 
 local injection = [=[
--- CACHE DE CATÁLOGO: indexa todas as fotos uma vez por job para evitar
--- catalog:findPhotoByPath(path) em cada arquivo já importado.
+-- CACHE DE CATÁLOGO DA SESSÃO: indexa todas as fotos apenas uma vez por catálogo
+-- enquanto o Lightroom permanecer aberto. Jobs seguintes reutilizam o mesmo índice.
 source = replaceOnce(source,
 [[local function importOneAttempt(catalog,path)]],
 [[local catalogPhotoIndex=nil
 local catalogPhotoIndexCatalogPath=nil
+local catalogPhotoIndexReadyAt=nil
 
 local function normalizeCatalogPath(path)
     if not path then return nil end
@@ -33,7 +35,8 @@ local function buildCatalogPhotoIndex(catalog)
         local key=normalizeCatalogPath(path)
         if key then index[key]=photo end
     end
-    plainLog('CATALOG_INDEX_READY count='..tostring(#photos))
+    catalogPhotoIndexReadyAt=os.time()
+    plainLog('CATALOG_INDEX_READY count='..tostring(#photos)..' session_cache=true')
     return index
 end
 
@@ -51,7 +54,7 @@ local function ensureCatalogPhotoIndex(catalog)
 end
 
 local function importOneAttempt(catalog,path)]],
-'cache de catálogo por job')
+'cache persistente do catálogo na sessão')
 
 source = replaceOnce(source,
 [[    local findMethod=catalog.findPhotoByPath
@@ -71,7 +74,7 @@ source = replaceOnce(source,
     if before then return before,'skipped',nil end
 
     local findMethod=catalog.findPhotoByPath]],
-'consulta individual substituída por cache')
+'consulta individual substituída por cache persistente')
 
 source = replaceOnce(source,
 [[    if imported then return imported,'imported',nil end
@@ -86,7 +89,7 @@ source = replaceOnce(source,
         return nil,'failed','foto não retornada por addPhoto e API findPhotoByPath indisponível'
     end
     local afterOk,after=pcall(findMethod,catalog,path)]],
-'cache após addPhoto')
+'cache atualizado após addPhoto')
 
 source = replaceOnce(source,
 [[    if after then return after,'imported',nil end]],
@@ -94,7 +97,7 @@ source = replaceOnce(source,
         if normalizedPath then index[normalizedPath]=after end
         return after,'imported',nil
     end]],
-'cache após confirmação')
+'cache atualizado após confirmação')
 
 source = replaceOnce(source,
 [[local MAX_ATTEMPTS = 10
