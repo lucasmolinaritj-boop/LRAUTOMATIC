@@ -2,7 +2,7 @@ __version__ = "0.1.0"
 
 
 def install_homepicz_queue_guard() -> None:
-    """Instala a guarda da fila sem alterar o scheduler grande diretamente."""
+    """Instala guardas de fila e cobertura sem alterar o scheduler grande diretamente."""
     try:
         from . import homepicz_scheduler as scheduler
         from .homepicz_scheduler_guard import guarded_cycle, next_poll_seconds
@@ -20,6 +20,38 @@ def install_homepicz_queue_guard() -> None:
         )
 
     scheduler._is_homepicz_job = safe_is_homepicz_job
+
+    # Uma fonte só pode ser considerada coberta depois de o Lightroom concluir
+    # aquela fonte. Jobs queued/running são protegidos pela guarda de fila e não
+    # devem adiantar o inventário, pois isso pode esconder o próximo trabalho.
+    def safe_covered_counts(jobs, collection_set):
+        covered = {}
+        for job in jobs:
+            if not safe_is_homepicz_job(job):
+                continue
+            request = getattr(job, "request", None)
+            if getattr(request, "collection_set", None) != collection_set:
+                continue
+            if str(getattr(job, "status", "")) not in {"completed", "partial"}:
+                continue
+
+            progress_by_path = {
+                scheduler._normalize_path(item.path): item
+                for item in getattr(job, "progress", [])
+            }
+            for source in getattr(request, "sources", []):
+                key = scheduler._normalize_path(source.path)
+                progress = progress_by_path.get(key)
+                if progress is None or str(getattr(progress, "status", "")) != "completed":
+                    continue
+                known = max(
+                    int(getattr(source, "expected_count", 0) or 0),
+                    int(getattr(progress, "discovered", 0) or 0),
+                )
+                covered[key] = max(covered.get(key, 0), known)
+        return covered
+
+    scheduler._covered_counts = safe_covered_counts
 
     original = getattr(scheduler, "run_cycle", None)
     if original is not None and not getattr(original, "_homepicz_guarded", False):
