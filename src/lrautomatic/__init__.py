@@ -62,3 +62,10 @@ try:
     install_homepicz_editor_features()
 except Exception:
     pass
+
+try:
+    from .raw_creation_time import install_raw_creation_time
+
+    install_raw_creation_time()
+except Exception:
+    pass
