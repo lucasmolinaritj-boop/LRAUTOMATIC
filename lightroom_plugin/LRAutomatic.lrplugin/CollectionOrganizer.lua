@@ -4,7 +4,7 @@ local LrPathUtils = import 'LrPathUtils'
 local Json = require 'Json'
 
 local Organizer = {}
-local ORGANIZATION_VERSION = 3
+local ORGANIZATION_VERSION = 4
 
 local function homePath()
     local home = LrPathUtils.getStandardFilePath('home')
@@ -90,6 +90,38 @@ local function hourName(value)
         return string.format('%02dh%02d', tonumber(hour), tonumber(minute))
     end
     return 'Sem horário'
+end
+
+local function dateName(value)
+    local text = cleanName(value, '')
+    local day, month, year = string.match(text, '(%d%d?)/(%d%d?)/(%d%d%d%d)')
+    if not day then
+        day, month, year = string.match(text, '(%d%d?)%-(%d%d?)%-(%d%d%d%d)')
+    end
+    if not day then
+        year, month, day = string.match(text, '(%d%d%d%d)%-(%d%d?)%-(%d%d?)')
+    end
+    if not day or not month or not year then return nil end
+
+    day, month, year = tonumber(day), tonumber(month), tonumber(year)
+    if not day or not month or not year then return nil end
+    if day < 1 or day > 31 or month < 1 or month > 12 or year < 1900 then return nil end
+    return string.format('%02d-%02d-%04d', day, month, year)
+end
+
+local function isLegacyWeekendRootName(name)
+    local text = cleanName(name, '')
+    return string.match(
+        text,
+        '^Home Picz%s*%-%s*%d%d%-%d%d%-%d%d%d%d_a_%d%d%-%d%d%-%d%d%d%d$'
+    ) ~= nil
+end
+
+local function collectionRootName(defaultRootName, source)
+    if not string.match(defaultRootName, '^Home Picz%s*%-') then return defaultRootName end
+    local sourceDate = dateName(source and source.scheduled_at)
+    if not sourceDate then return defaultRootName end
+    return 'Home Picz - ' .. sourceDate
 end
 
 local function appendEvent(job, stage, title, detail, level)
@@ -224,15 +256,22 @@ local function addToHierarchy(catalog, pathNames, collectionName, photos, counte
     end
 end
 
+local function legacyWeekendMigrationNeeded(job, request)
+    if not isLegacyWeekendRootName(request.collection_set) then return false end
+    return (tonumber(job.collections_organization_version or 0) or 0) < ORGANIZATION_VERSION
+end
+
 local function needsOrganization(job, request)
-    if tostring(job.collections_run_once_token or '') ~= tostring(job.job_id or '') then
-        return false
-    end
     if request.organize_collections_by_photographer ~= true
         and request.organize_collections_by_client ~= true then
         return false
     end
-    return tostring(job.collections_status or '') == 'requested'
+
+    local explicitlyRequested =
+        tostring(job.collections_run_once_token or '') == tostring(job.job_id or '')
+        and tostring(job.collections_status or '') == 'requested'
+
+    return explicitlyRequested or legacyWeekendMigrationNeeded(job, request)
 end
 
 local function organizeJob(path, job)
@@ -247,6 +286,7 @@ local function organizeJob(path, job)
         return false
     end
 
+    local legacyMigration = legacyWeekendMigrationNeeded(job, request)
     job.collections_status = 'running'
     writeJson(path, job)
 
@@ -260,23 +300,24 @@ local function organizeJob(path, job)
         clientSkipped = 0,
     }
 
-    local rootName = cleanName(request.collection_set, 'Home Picz')
+    local defaultRootName = cleanName(request.collection_set, 'Home Picz')
     for _, source in ipairs(request.sources or {}) do
         local photos = collectPhotos(catalog, source, request)
         local workId = cleanName(source.work_id, cleanName(LrPathUtils.leafName(source.path or ''), 'Sem ID'))
         local collectionName = cleanName(source.collection, workId)
         local scheduledHour = hourName(source.scheduled_at)
+        local sourceRootName = collectionRootName(defaultRootName, source)
 
         if request.organize_collections_by_photographer == true then
             local photographer = cleanName(source.photographer, 'Sem fotógrafo')
-            addToHierarchy(catalog, {rootName, 'Fotógrafos', photographer, scheduledHour}, collectionName, photos, counters)
+            addToHierarchy(catalog, {sourceRootName, 'Fotógrafos', photographer, scheduledHour}, collectionName, photos, counters)
             counters.photographerTrees = counters.photographerTrees + 1
         end
 
         if request.organize_collections_by_client == true then
             local client = optionalName(source.client)
             if client then
-                addToHierarchy(catalog, {rootName, 'Clientes', client, scheduledHour}, collectionName, photos, counters)
+                addToHierarchy(catalog, {sourceRootName, 'Clientes', client, scheduledHour}, collectionName, photos, counters)
                 counters.clientTrees = counters.clientTrees + 1
             else
                 counters.clientSkipped = counters.clientSkipped + 1
@@ -292,14 +333,16 @@ local function organizeJob(path, job)
     appendEvent(
         job,
         'collections',
-        counters.failures > 0 and 'Coleções organizadas com ressalvas' or 'Coleções organizadas na nova estrutura',
-        'Estrutura: Home Picz - DATA > Fotógrafos/Clientes > Nome > Horário > ID - Rua; conjuntos novos: '
+        counters.failures > 0 and 'Coleções organizadas com ressalvas'
+            or (legacyMigration and 'Coleções antigas separadas por dia' or 'Coleções organizadas por dia'),
+        'Estrutura: Home Picz - DIA > Fotógrafos/Clientes > Nome > Horário > ID - Rua; conjuntos novos: '
             .. counters.setsCreated
             .. '; coleções novas: ' .. counters.collectionsCreated
             .. '; vínculos de fotos: ' .. counters.photosAdded
             .. '; árvores por fotógrafo: ' .. counters.photographerTrees
             .. '; árvores por cliente: ' .. counters.clientTrees
             .. '; clientes ausentes ignorados: ' .. counters.clientSkipped
+            .. '; migração de período agregado: ' .. tostring(legacyMigration)
             .. '; falhas: ' .. counters.failures .. '.',
         counters.failures > 0 and 'warning' or 'info'
     )
