@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lrautomatic"
-version = "0.5.0"
+version = "0.5.1"
 description = "Home Picz control center, Lightroom Classic automation, API and Windows service"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,12 +15,13 @@ dependencies = [
   "typer>=0.12,<1",
   "httpx>=0.27,<1",
   "pywin32>=306; platform_system == 'Windows'",
-  "psutil>=6,<8"
+  "psutil>=6,<8",
+  "tkinterdnd2>=0.6.2,<1"
 ]
 
 [project.scripts]
 lrautomatic = "lrautomatic.cli:app"
-lrautomatic-desktop = "lrautomatic.desktop_raw_created:main"
+lrautomatic-desktop = "lrautomatic.desktop_range_drag:main"
 lrautomatic-session-agent = "lrautomatic.session_agent_stable:main"
 lrautomatic-service = "lrautomatic.windows_service:main"
 
