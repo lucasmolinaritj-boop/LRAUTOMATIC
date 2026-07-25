@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 COLLECTION_ORGANIZATION_VERSION = 4
@@ -98,6 +97,14 @@ def install_collection_job_reliability() -> None:
                 getattr(job, "collections_organization_version", 0) or 0
             )
             status = str(getattr(job, "collections_status", "") or "")
+            active_path_exists = store._job_path(job.job_id).exists()
+
+            # "running" dentro de jobs/ significa que o Lightroom está trabalhando
+            # agora. Só recuperamos esse estado quando ele apareceu arquivado, o que
+            # indica interrupção antiga e não uma operação concorrente legítima.
+            actively_organizing = status == "running" and active_path_exists
+            if actively_organizing:
+                continue
 
             needs_reconcile = (
                 request_version < COLLECTION_ORGANIZATION_VERSION
@@ -105,7 +112,8 @@ def install_collection_job_reliability() -> None:
                     applied_version < COLLECTION_ORGANIZATION_VERSION
                     and status not in {"partial", "failed"}
                 )
-                or status in _PENDING_COLLECTION_STATUSES
+                or status == "requested"
+                or (status == "running" and not active_path_exists)
             )
             if not needs_reconcile:
                 continue
