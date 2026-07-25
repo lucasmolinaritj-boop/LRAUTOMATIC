@@ -7,7 +7,7 @@ local LrFileUtils = import 'LrFileUtils'
 local LrPathUtils = import 'LrPathUtils'
 
 local Runner = require 'JobRunner57'
-local CollectionOrganizer = require 'CollectionOrganizer'
+local CollectionOrganizer = require 'CollectionOrganizerReliable'
 local originalProcessQueuedOnce = Runner.processQueuedOnce
 local originalRunLoop = Runner.runLoop
 
@@ -72,6 +72,6 @@ function Runner.runLoop(shouldStop)
 end
 
 Runner.engine_name = 'JobRunner'
-Runner.engine_version = '4.11.2-single-official-entrypoint-lr104'
+Runner.engine_version = '4.11.3-collections-reliable-lr104'
 
 return Runner
