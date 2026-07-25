@@ -261,6 +261,35 @@ local function legacyWeekendMigrationNeeded(job, request)
     return (tonumber(job.collections_organization_version or 0) or 0) < ORGANIZATION_VERSION
 end
 
+local function hasPendingLegacyJobs(rootName, currentPath)
+    for candidatePath in LrFileUtils.files(jobsDir()) do
+        if candidatePath ~= currentPath and isJobFile(candidatePath) then
+            local candidate = readJson(candidatePath)
+            local request = candidate and candidate.request or nil
+            local status = candidate and tostring(candidate.status or '') or ''
+            local version = candidate and (tonumber(candidate.collections_organization_version or 0) or 0) or 0
+            if request
+                and cleanName(request.collection_set, '') == rootName
+                and (status == 'completed' or status == 'partial')
+                and (request.organize_collections_by_photographer == true
+                    or request.organize_collections_by_client == true)
+                and version < ORGANIZATION_VERSION then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function removeLegacyWeekendRoot(catalog, rootName)
+    local legacyRoot = findCollectionSet(catalog, nil, rootName)
+    if not legacyRoot then return true, false end
+    local ok = withWrite(catalog, 'LRAutomatic: remover conjunto agregado antigo ' .. rootName, function()
+        legacyRoot:delete()
+    end)
+    return ok, ok
+end
+
 local function needsOrganization(job, request)
     if request.organize_collections_by_photographer ~= true
         and request.organize_collections_by_client ~= true then
@@ -298,6 +327,7 @@ local function organizeJob(path, job)
         photographerTrees = 0,
         clientTrees = 0,
         clientSkipped = 0,
+        legacySetsRemoved = 0,
     }
 
     local defaultRootName = cleanName(request.collection_set, 'Home Picz')
@@ -325,10 +355,21 @@ local function organizeJob(path, job)
         end
     end
 
+    if legacyMigration and counters.failures == 0 and not hasPendingLegacyJobs(defaultRootName, path) then
+        local removedOk, removed = removeLegacyWeekendRoot(catalog, defaultRootName)
+        if not removedOk then
+            counters.failures = counters.failures + 1
+        elseif removed then
+            counters.legacySetsRemoved = 1
+        end
+    end
+
     job.collection_sets_created = counters.setsCreated
     job.collections_created = counters.collectionsCreated
     job.collections_status = counters.failures > 0 and 'partial' or 'completed'
-    job.collections_organization_version = ORGANIZATION_VERSION
+    if not legacyMigration or counters.failures == 0 then
+        job.collections_organization_version = ORGANIZATION_VERSION
+    end
     job.collections_run_once_token = nil
     appendEvent(
         job,
@@ -343,6 +384,7 @@ local function organizeJob(path, job)
             .. '; árvores por cliente: ' .. counters.clientTrees
             .. '; clientes ausentes ignorados: ' .. counters.clientSkipped
             .. '; migração de período agregado: ' .. tostring(legacyMigration)
+            .. '; conjuntos agregados antigos removidos: ' .. counters.legacySetsRemoved
             .. '; falhas: ' .. counters.failures .. '.',
         counters.failures > 0 and 'warning' or 'info'
     )
