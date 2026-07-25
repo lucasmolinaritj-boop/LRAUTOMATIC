@@ -57,6 +57,13 @@ def install_homepicz_queue_guard() -> None:
 install_homepicz_queue_guard()
 
 try:
+    from .collection_job_reliability import install_collection_job_reliability
+
+    install_collection_job_reliability()
+except Exception:
+    pass
+
+try:
     from .homepicz_editor_features import install_homepicz_editor_features
 
     install_homepicz_editor_features()
