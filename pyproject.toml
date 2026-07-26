@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lrautomatic"
-version = "0.5.3"
+version = "0.5.4"
 description = "Home Picz control center, Lightroom Classic automation, API and Windows service"
 readme = "README.md"
 requires-python = ">=3.11"
