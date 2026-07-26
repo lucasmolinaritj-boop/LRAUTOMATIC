@@ -1,6 +1,9 @@
 __version__ = "0.1.0"
 
 
+MANUAL_COLLECTION_PREFIX = "Home Picz - Manual - "
+
+
 def install_homepicz_queue_guard() -> None:
     """Instala a guarda da fila sem alterar o scheduler grande diretamente."""
     try:
@@ -11,9 +14,13 @@ def install_homepicz_queue_guard() -> None:
 
     def safe_is_homepicz_job(job) -> bool:
         request = getattr(job, "request", None)
-        collection_set = getattr(request, "collection_set", None)
-        return str(collection_set or "").startswith(
-            getattr(scheduler, "HOME_PICZ_COLLECTION_PREFIX", "Home Picz - ")
+        collection_set = str(getattr(request, "collection_set", None) or "")
+        prefix = getattr(scheduler, "HOME_PICZ_COLLECTION_PREFIX", "Home Picz - ")
+        # Jobs enviados manualmente pelo Gerenciador podem pertencer a qualquer dia.
+        # Eles usam o prefixo Home Picz para o organizador Lua separar as coleções por
+        # data, mas não podem ser cancelados quando o scheduler muda de período.
+        return collection_set.startswith(prefix) and not collection_set.startswith(
+            MANUAL_COLLECTION_PREFIX
         )
 
     scheduler._is_homepicz_job = safe_is_homepicz_job
