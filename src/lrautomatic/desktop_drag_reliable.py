@@ -7,19 +7,33 @@ from tkinter import messagebox, ttk
 from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP
 
 from .desktop_range_drag import RangeDragDesktopApp
+from .homepicz_scheduler import current_import_window
 from .models import ImportJobRequest, ImportSource
-from .operational_inventory import OperationalFolder
+from .operational_inventory import OperationalFolder, OperationalInventory
 
 MANUAL_COLLECTION_PREFIX = "Home Picz - Manual - "
 COLLECTION_ORGANIZATION_VERSION = 4
 
 
 class ReliableDragDesktopApp(RangeDragDesktopApp):
-    """Arraste confiável e importação direta com organização de coleções por dia."""
+    """Gerenciador integrado ao período operacional e à fila do Lightroom."""
 
     def __init__(self, config_path: str = "config.json") -> None:
+        self._open_inventory_when_ready = False
         super().__init__(config_path)
-        self.title("LRAutomatic V5.9")
+
+        # A página inicial deve nascer com o mesmo período usado pela automação.
+        # Aos sábados, domingos e segundas isso resulta em sexta + sábado.
+        default_window = current_import_window(self.settings)
+        self.raw_inventory_start_date = default_window.start
+        self.raw_inventory_end_date = default_window.end
+        self.raw_inventory_date = default_window.start
+        self.raw_calendar_button.configure(text=self._raw_calendar_button_text())
+        self.inventory_state.set(
+            f"Período do Gerenciador de RAW: {self._selected_raw_window_label()}. "
+            "Clique em Ver pastas para consultar."
+        )
+        self.title("LRAutomatic V6.1")
 
     @staticmethod
     def _find_inventory_footer(popup: tk.Toplevel) -> ttk.Frame | None:
@@ -35,7 +49,160 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
                 return child
         return None
 
+    @staticmethod
+    def _find_filter_box(popup: tk.Toplevel) -> ttk.LabelFrame | None:
+        for child in popup.winfo_children():
+            if not isinstance(child, ttk.LabelFrame):
+                continue
+            try:
+                if str(child.cget("text")) == "Filtros e ordenação":
+                    return child
+            except tk.TclError:
+                continue
+        return None
+
+    @classmethod
+    def _promote_situation_filter(cls, popup: tk.Toplevel) -> None:
+        """Coloca Situação na primeira linha para não ficar escondida."""
+        controls = cls._find_filter_box(popup)
+        if controls is None:
+            return
+
+        labels: dict[str, ttk.Label] = {}
+        combos: list[ttk.Combobox] = []
+        checkbuttons: list[ttk.Checkbutton] = []
+        entries: list[ttk.Entry] = []
+        buttons: list[ttk.Button] = []
+
+        for child in controls.winfo_children():
+            if isinstance(child, ttk.Label):
+                try:
+                    labels[str(child.cget("text"))] = child
+                except tk.TclError:
+                    pass
+            elif isinstance(child, ttk.Combobox):
+                combos.append(child)
+            elif isinstance(child, ttk.Checkbutton):
+                checkbuttons.append(child)
+            elif isinstance(child, ttk.Entry):
+                entries.append(child)
+            elif isinstance(child, ttk.Button):
+                buttons.append(child)
+
+        combo_by_label: dict[str, ttk.Combobox] = {}
+        for label_text, label_widget in labels.items():
+            try:
+                label_info = label_widget.grid_info()
+                label_row = int(label_info.get("row", -1))
+                label_column = int(label_info.get("column", -1))
+            except (tk.TclError, TypeError, ValueError):
+                continue
+            for combo in combos:
+                try:
+                    combo_info = combo.grid_info()
+                    combo_row = int(combo_info.get("row", -1))
+                    combo_column = int(combo_info.get("column", -1))
+                except (tk.TclError, TypeError, ValueError):
+                    continue
+                if combo_row == label_row + 1 and combo_column == label_column:
+                    combo_by_label[label_text] = combo
+                    break
+
+        # Situação fica ao lado de Dia e continua combinável com todos os filtros.
+        positions = {
+            "Dia": (0, 0),
+            "Situação": (0, 1),
+            "Fotógrafo": (0, 2),
+            "Editor de foto": (0, 3),
+            "Cliente": (0, 4),
+            "Serviço": (2, 0),
+            "Ordenar por": (2, 1),
+        }
+        for column in range(5):
+            controls.columnconfigure(column, weight=1)
+
+        for label_text, (row, column) in positions.items():
+            label_widget = labels.get(label_text)
+            combo = combo_by_label.get(label_text)
+            if label_widget is not None:
+                label_widget.grid(
+                    row=row,
+                    column=column,
+                    sticky="w",
+                    padx=(0, 8),
+                )
+            if combo is not None:
+                combo.grid(
+                    row=row + 1,
+                    column=column,
+                    sticky="ew",
+                    padx=(0, 8),
+                )
+
+        for checkbutton in checkbuttons:
+            try:
+                if str(checkbutton.cget("text")) == "Decrescente":
+                    checkbutton.grid(row=3, column=2, sticky="w", padx=(4, 8))
+            except tk.TclError:
+                continue
+
+        search_label = next(
+            (widget for text, widget in labels.items() if text.startswith("Pesquisar ")),
+            None,
+        )
+        if search_label is not None:
+            search_label.grid(
+                row=4,
+                column=0,
+                columnspan=5,
+                sticky="w",
+                pady=(10, 3),
+            )
+        if entries:
+            entries[0].grid(
+                row=5,
+                column=0,
+                columnspan=4,
+                sticky="ew",
+                padx=(0, 8),
+            )
+        for button in buttons:
+            try:
+                if str(button.cget("text")) == "Limpar filtros":
+                    button.grid(row=5, column=4, sticky="ew")
+            except tk.TclError:
+                continue
+
+    def _raw_calendar_inventory_done(
+        self,
+        snapshot: OperationalInventory,
+        metadata: dict[str, dict[str, str]],
+    ) -> None:
+        super()._raw_calendar_inventory_done(snapshot, metadata)
+        if self._open_inventory_when_ready:
+            self._open_inventory_when_ready = False
+            self.after_idle(self._show_inventory_details)
+
+    def _raw_calendar_inventory_failed(self, error: Exception) -> None:
+        self._open_inventory_when_ready = False
+        super()._raw_calendar_inventory_failed(error)
+
     def _show_inventory_details(self) -> None:
+        # Ver pastas vira uma ação única: consulta quando ainda não há inventário;
+        # se a consulta já existe, apenas abre a tabela sem consultar novamente.
+        if self.inventory_snapshot is None:
+            self._open_inventory_when_ready = True
+            if self.inventory_scanning:
+                self.inventory_state.set(
+                    "Consulta em andamento. O Gerenciador abrirá automaticamente ao concluir."
+                )
+            else:
+                self.inventory_state.set(
+                    f"Consultando {self._selected_raw_window_label()} para abrir o Gerenciador..."
+                )
+                self._refresh_inventory()
+            return
+
         previous_children = set(self.winfo_children())
         super()._show_inventory_details()
 
@@ -48,6 +215,8 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
             return
 
         popup = new_popups[-1]
+        self._promote_situation_filter(popup)
+
         tree = self._find_treeview(popup)
         snapshot = self.inventory_snapshot
         if tree is None or snapshot is None:
@@ -189,8 +358,6 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
                 parent=popup,
             )
 
-        # O botão antigo ficava numa quarta linha abaixo da janela e podia ficar oculto.
-        # Agora ele é encaixado no rodapé original, abaixo dos demais botões da tabela.
         footer = self._find_inventory_footer(popup)
         if footer is None:
             footer = ttk.Frame(popup, padding=(14, 6, 14, 14))
@@ -214,7 +381,7 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
         try:
             popup.update_idletasks()
             required_height = popup.winfo_reqheight()
-            current_width = max(popup.winfo_width(), 1220)
+            current_width = max(popup.winfo_width(), 1280)
             screen_height = popup.winfo_screenheight()
             popup.geometry(f"{current_width}x{min(required_height + 20, screen_height - 80)}")
         except tk.TclError:
