@@ -10,13 +10,16 @@ from .desktop_range_drag import RangeDragDesktopApp
 from .models import ImportJobRequest, ImportSource
 from .operational_inventory import OperationalFolder
 
+MANUAL_COLLECTION_PREFIX = "Home Picz - Manual - "
+COLLECTION_ORGANIZATION_VERSION = 4
+
 
 class ReliableDragDesktopApp(RangeDragDesktopApp):
-    """Arraste de pastas com lista Tcl explícita e importação direta de reserva."""
+    """Arraste confiável e importação direta com organização de coleções por dia."""
 
     def __init__(self, config_path: str = "config.json") -> None:
         super().__init__(config_path)
-        self.title("LRAutomatic V5.7")
+        self.title("LRAutomatic V5.8")
 
     def _show_inventory_details(self) -> None:
         previous_children = set(self.winfo_children())
@@ -125,6 +128,7 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
                         path=folder.path,
                         collection=collection,
                         recursive=bool(self.settings.homepicz_recursive),
+                        expected_count=folder.total,
                         work_id=folder.work_id,
                         photographer=folder.photographer,
                         client=str(metadata.get("cliente") or "").strip() or None,
@@ -133,13 +137,16 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
                     )
                 )
 
+            selected_window = self._selected_raw_window()
+            manual_collection_set = f"{MANUAL_COLLECTION_PREFIX}{selected_window.label}"
             request = ImportJobRequest(
                 sources=sources,
-                collection_set=None,
+                collection_set=manual_collection_set,
                 recursive=bool(self.settings.homepicz_recursive),
                 create_collections=False,
-                organize_collections_by_photographer=False,
-                organize_collections_by_client=False,
+                organize_collections_by_photographer=True,
+                organize_collections_by_client=True,
+                collection_organization_version=COLLECTION_ORGANIZATION_VERSION,
                 build_standard_previews=bool(self.settings.homepicz_standard_previews),
                 standard_preview_size=int(self.settings.homepicz_standard_preview_size),
                 build_smart_previews=bool(self.settings.homepicz_smart_previews),
@@ -149,6 +156,18 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
             )
             try:
                 job = self.store.create(request)
+                job.collections_status = "requested"
+                job.collections_organization_version = 0
+                job.collections_run_once_token = job.job_id
+                job.add_event(
+                    "collections",
+                    "Organização por dia solicitada",
+                    (
+                        "Após a importação, as fotos serão vinculadas em Home Picz - DIA > "
+                        "Fotógrafos/Clientes > Nome > Horário > ID - Rua."
+                    ),
+                )
+                self.store.save(job)
             except Exception as exc:
                 messagebox.showerror(
                     "Importar no Lightroom",
@@ -160,11 +179,15 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
             self.selected_job_id = job.job_id
             self._refresh_jobs(True)
             status_var.set(
-                f"{len(folders)} pasta(s) enviadas à fila do Lightroom: {job.job_id}."
+                f"{len(folders)} pasta(s) enviadas à fila; as coleções serão organizadas por dia após a importação."
             )
             messagebox.showinfo(
                 "Importar no Lightroom",
-                f"{len(folders)} pasta(s) enviadas à fila.\n\nJob: {job.job_id}",
+                (
+                    f"{len(folders)} pasta(s) enviadas à fila.\n\n"
+                    "As coleções serão criadas conforme a data de cada trabalho, mesmo em uma seleção com vários dias.\n\n"
+                    f"Job: {job.job_id}"
+                ),
                 parent=popup,
             )
 
