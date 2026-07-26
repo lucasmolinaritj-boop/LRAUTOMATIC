@@ -19,7 +19,21 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
 
     def __init__(self, config_path: str = "config.json") -> None:
         super().__init__(config_path)
-        self.title("LRAutomatic V5.8")
+        self.title("LRAutomatic V5.9")
+
+    @staticmethod
+    def _find_inventory_footer(popup: tk.Toplevel) -> ttk.Frame | None:
+        """Localiza o rodapé original da tabela para manter a ação sempre visível."""
+        for child in popup.winfo_children():
+            if not isinstance(child, ttk.Frame):
+                continue
+            try:
+                info = child.grid_info()
+            except tk.TclError:
+                continue
+            if str(info.get("row")) == "2":
+                return child
+        return None
 
     def _show_inventory_details(self) -> None:
         previous_children = set(self.winfo_children())
@@ -42,25 +56,10 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
         folders_by_id = {folder.work_id: folder for folder in snapshot.folders}
         status_var = tk.StringVar(
             value=(
-                "Arraste as linhas para a Grade da Biblioteca. Se o Lightroom recusar, "
-                "use Importar seleção no Lightroom."
+                "Selecione uma ou mais linhas. O botão abaixo cria a tarefa diretamente; "
+                "o arraste continua disponível como alternativa."
             )
         )
-
-        actions = ttk.LabelFrame(
-            popup,
-            text="Importação no Lightroom",
-            padding=(14, 8),
-        )
-        actions.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 12))
-        actions.columnconfigure(0, weight=1)
-        ttk.Label(
-            actions,
-            textvariable=status_var,
-            style="Muted.TLabel",
-            wraplength=850,
-            justify="left",
-        ).grid(row=0, column=0, sticky="w")
 
         def selected_folders() -> list[OperationalFolder]:
             result: list[OperationalFolder] = []
@@ -91,8 +90,7 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
             action = str(getattr(event, "action", "") or "")
             if action.lower() in {"refuse_drop", "none", ""}:
                 status_var.set(
-                    "O destino não confirmou o drop. Confira se Lightroom e LRAutomatic "
-                    "estão no mesmo nível de privilégio ou use a importação direta."
+                    "O Lightroom não confirmou o drop. Use o botão IMPORTAR SELEÇÃO NO LIGHTROOM."
                 )
             else:
                 status_var.set(f"Arraste finalizado: {action}.")
@@ -104,7 +102,7 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
         else:
             detail = f" Detalhe: {self._native_drag_error}" if self._native_drag_error else ""
             status_var.set(
-                "Suporte nativo de arraste indisponível. Execute instalar.bat."
+                "Arraste nativo indisponível, mas a importação pelo botão funciona normalmente."
                 + detail
             )
 
@@ -113,7 +111,7 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
             if not folders:
                 messagebox.showinfo(
                     "Importar no Lightroom",
-                    "Selecione uma ou mais pastas existentes.",
+                    "Selecione uma ou mais linhas da tabela antes de importar.",
                     parent=popup,
                 )
                 return
@@ -179,24 +177,48 @@ class ReliableDragDesktopApp(RangeDragDesktopApp):
             self.selected_job_id = job.job_id
             self._refresh_jobs(True)
             status_var.set(
-                f"{len(folders)} pasta(s) enviadas à fila; as coleções serão organizadas por dia após a importação."
+                f"{len(folders)} pasta(s) enviadas à fila; as coleções serão organizadas por dia."
             )
             messagebox.showinfo(
                 "Importar no Lightroom",
                 (
                     f"{len(folders)} pasta(s) enviadas à fila.\n\n"
-                    "As coleções serão criadas conforme a data de cada trabalho, mesmo em uma seleção com vários dias.\n\n"
+                    "As coleções serão criadas conforme a data de cada trabalho.\n\n"
                     f"Job: {job.job_id}"
                 ),
                 parent=popup,
             )
 
+        # O botão antigo ficava numa quarta linha abaixo da janela e podia ficar oculto.
+        # Agora ele é encaixado no rodapé original, abaixo dos demais botões da tabela.
+        footer = self._find_inventory_footer(popup)
+        if footer is None:
+            footer = ttk.Frame(popup, padding=(14, 6, 14, 14))
+            footer.grid(row=2, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+
         ttk.Button(
-            actions,
-            text="IMPORTAR SELEÇÃO NO LIGHTROOM",
+            footer,
+            text="IMPORTAR SELEÇÃO NO LIGHTROOM — GERAR TAREFA",
             style="Primary.TButton",
             command=queue_selected_import,
-        ).grid(row=0, column=1, padx=(12, 0))
+        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 4))
+        ttk.Label(
+            footer,
+            textvariable=status_var,
+            style="Muted.TLabel",
+            wraplength=1100,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(2, 0))
+
+        try:
+            popup.update_idletasks()
+            required_height = popup.winfo_reqheight()
+            current_width = max(popup.winfo_width(), 1220)
+            screen_height = popup.winfo_screenheight()
+            popup.geometry(f"{current_width}x{min(required_height + 20, screen_height - 80)}")
+        except tk.TclError:
+            pass
 
 
 def main() -> None:
