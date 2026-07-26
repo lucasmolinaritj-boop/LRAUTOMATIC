@@ -11,11 +11,11 @@ from .operational_inventory import OperationalFolder
 
 
 class RawCreatedDesktopApp(RawCalendarDesktopApp):
-    """Gerenciador RAW com coluna do último arquivo baseada na criação."""
+    """Gerenciador RAW com filtros completos e último arquivo baseado na criação."""
 
     def __init__(self, config_path: str = "config.json") -> None:
         super().__init__(config_path)
-        self.title("LRAutomatic V5.3")
+        self.title("LRAutomatic V5.5")
 
     @staticmethod
     def _created_label(timestamp: float | None) -> str:
@@ -34,27 +34,109 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
 
         popup = tk.Toplevel(self)
         popup.title("Gerenciador de RAW — tabela completa")
-        popup.geometry("1580x760")
-        popup.minsize(1100, 560)
+        popup.geometry("1680x820")
+        popup.minsize(1180, 620)
         popup.transient(self)
         popup.columnconfigure(0, weight=1)
         popup.rowconfigure(1, weight=1)
 
-        controls = ttk.Frame(popup, padding=(14, 14, 14, 8))
-        controls.grid(row=0, column=0, sticky="ew")
-        controls.columnconfigure(1, weight=1)
-        ttk.Label(controls, text="Filtrar:").grid(row=0, column=0, padx=(0, 8))
-        search_var = tk.StringVar()
-        search_entry = ttk.Entry(controls, textvariable=search_var)
-        search_entry.grid(row=0, column=1, sticky="ew")
+        controls = ttk.LabelFrame(popup, text="Filtros e ordenação", padding=(14, 10))
+        controls.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
+        for column in range(7):
+            controls.columnconfigure(column, weight=1 if column in {0, 1, 2, 3, 6} else 0)
+
+        photographer_var = tk.StringVar(value="Todos")
+        editor_var = tk.StringVar(value="Todos")
+        client_var = tk.StringVar(value="Todos")
+        service_var = tk.StringVar(value="Todos")
         status_var = tk.StringVar(value="Todos")
-        ttk.Combobox(
+        order_var = tk.StringVar(value="Horário")
+        descending_var = tk.BooleanVar(value=False)
+        search_var = tk.StringVar()
+
+        def metadata(folder: OperationalFolder) -> dict[str, str]:
+            return self.raw_metadata.get(folder.work_id, {})
+
+        def editor_name(folder: OperationalFolder) -> str:
+            return metadata(folder).get("editorFoto") or "Editor de foto não informado"
+
+        def client_name(folder: OperationalFolder) -> str:
+            return metadata(folder).get("cliente") or "Cliente não informado"
+
+        def service_name(folder: OperationalFolder) -> str:
+            return folder.service or metadata(folder).get("servico") or "Serviço não informado"
+
+        photographers = [
+            "Todos",
+            *sorted({folder.photographer for folder in snapshot.folders}, key=str.casefold),
+        ]
+        editors = [
+            "Todos",
+            *sorted({editor_name(folder) for folder in snapshot.folders}, key=str.casefold),
+        ]
+        clients = [
+            "Todos",
+            *sorted({client_name(folder) for folder in snapshot.folders}, key=str.casefold),
+        ]
+        services = [
+            "Todos",
+            *sorted({service_name(folder) for folder in snapshot.folders}, key=str.casefold),
+        ]
+
+        filter_specs = (
+            ("Fotógrafo", photographer_var, photographers, 21),
+            ("Editor de foto", editor_var, editors, 22),
+            ("Cliente", client_var, clients, 24),
+            ("Serviço", service_var, services, 23),
+            (
+                "Situação",
+                status_var,
+                ("Todos", "OK", "Com alerta", "Com RAW", "Sem RAW", "Pasta ausente"),
+                17,
+            ),
+            (
+                "Ordenar por",
+                order_var,
+                (
+                    "Horário",
+                    "ID",
+                    "Editor de foto",
+                    "Fotógrafo",
+                    "Cliente",
+                    "Serviço",
+                    "Rua",
+                    "Total RAW",
+                    "Último RAW",
+                    "Situação",
+                ),
+                17,
+            ),
+        )
+        filter_combos: list[ttk.Combobox] = []
+        for column, (label, variable, values, width) in enumerate(filter_specs):
+            ttk.Label(controls, text=label).grid(row=0, column=column, sticky="w")
+            combo = ttk.Combobox(
+                controls,
+                textvariable=variable,
+                values=values,
+                state="readonly",
+                width=width,
+            )
+            combo.grid(row=1, column=column, sticky="ew", padx=(0, 8))
+            filter_combos.append(combo)
+
+        ttk.Checkbutton(
             controls,
-            textvariable=status_var,
-            state="readonly",
-            values=("Todos", "OK", "Com alerta", "Sem RAW", "Pasta ausente"),
-            width=18,
-        ).grid(row=0, column=2, padx=(8, 0))
+            text="Decrescente",
+            variable=descending_var,
+        ).grid(row=1, column=6, sticky="w", padx=(4, 0))
+
+        ttk.Label(
+            controls,
+            text="Pesquisar ID, horário, editor, fotógrafo, cliente, serviço ou endereço",
+        ).grid(row=2, column=0, columnspan=7, sticky="w", pady=(10, 3))
+        search_entry = ttk.Entry(controls, textvariable=search_var)
+        search_entry.grid(row=3, column=0, columnspan=6, sticky="ew", padx=(0, 8))
 
         table_frame = ttk.Frame(popup, padding=(14, 0, 14, 8))
         table_frame.grid(row=1, column=0, sticky="nsew")
@@ -67,6 +149,7 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
             "editor",
             "fotografo",
             "cliente",
+            "servico",
             "rua",
             "cr2",
             "cr3",
@@ -82,6 +165,7 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
             ("editor", "Editor foto", 155),
             ("fotografo", "Fotógrafo", 145),
             ("cliente", "Cliente", 180),
+            ("servico", "Serviço", 180),
             ("rua", "Rua", 270),
             ("cr2", "CR2", 60),
             ("cr3", "CR3", 60),
@@ -90,7 +174,7 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
             ("ultimo_raw", "Último RAW (criado)", 155),
             ("situacao", "Situação", 210),
         )
-        sort_state = {"column": "horario", "reverse": False}
+        sort_state: dict[str, object] = {"column": "horario", "reverse": False}
         for key, title, width in definitions:
             tree.heading(key, text=title)
             tree.column(
@@ -98,7 +182,7 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
                 width=width,
                 minwidth=55,
                 anchor="w",
-                stretch=key in {"editor", "fotografo", "cliente", "rua", "situacao"},
+                stretch=key in {"editor", "fotografo", "cliente", "servico", "rua", "situacao"},
             )
         tree.grid(row=0, column=0, sticky="nsew")
         ybar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
@@ -109,13 +193,14 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
         folders_by_id = {folder.work_id: folder for folder in snapshot.folders}
 
         def row_values(folder: OperationalFolder) -> tuple[object, ...]:
-            meta = self.raw_metadata.get(folder.work_id, {})
+            meta = metadata(folder)
             return (
                 folder.work_id,
                 meta.get("horario") or self._hour_from_datetime(folder.scheduled_at),
-                meta.get("editorFoto") or "Editor de foto não informado",
+                editor_name(folder),
                 folder.photographer,
-                meta.get("cliente") or "Cliente não informado",
+                client_name(folder),
+                service_name(folder),
                 meta.get("rua") or "Rua não informada",
                 folder.cr2,
                 folder.cr3,
@@ -126,22 +211,37 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
             )
 
         def matches(folder: OperationalFolder) -> bool:
-            values = row_values(folder)
-            query = search_var.get().strip().casefold()
-            if query and query not in " ".join(str(value) for value in values).casefold():
+            if photographer_var.get() != "Todos" and folder.photographer != photographer_var.get():
                 return False
+            if editor_var.get() != "Todos" and editor_name(folder) != editor_var.get():
+                return False
+            if client_var.get() != "Todos" and client_name(folder) != client_var.get():
+                return False
+            if service_var.get() != "Todos" and service_name(folder) != service_var.get():
+                return False
+
             status = status_var.get()
             if status == "OK" and folder.warning != "OK":
                 return False
             if status == "Com alerta" and folder.warning == "OK":
                 return False
+            if status == "Com RAW" and not (folder.folder_exists and folder.total > 0):
+                return False
             if status == "Sem RAW" and not (folder.folder_exists and folder.total == 0):
                 return False
             if status == "Pasta ausente" and folder.folder_exists:
                 return False
+
+            query = search_var.get().strip().casefold()
+            if query and query not in " ".join(str(value) for value in row_values(folder)).casefold():
+                return False
             return True
 
         def sort_key(folder: OperationalFolder, column: str):
+            if column == "id":
+                return (0, int(folder.work_id)) if folder.work_id.isdigit() else (1, folder.work_id.casefold())
+            if column == "horario":
+                return self._parse_schedule(folder.scheduled_at)
             if column == "ultimo_raw":
                 return folder.latest_mtime or 0
             value = dict(zip(columns, row_values(folder)))[column]
@@ -149,15 +249,15 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
 
         result_var = tk.StringVar()
 
-        def render() -> None:
+        def render(*_args) -> None:
             selected = set(tree.selection())
             children = tree.get_children()
             if children:
                 tree.delete(*children)
             folders = [folder for folder in snapshot.folders if matches(folder)]
             folders.sort(
-                key=lambda folder: sort_key(folder, sort_state["column"]),
-                reverse=sort_state["reverse"],
+                key=lambda folder: sort_key(folder, str(sort_state["column"])),
+                reverse=bool(sort_state["reverse"]),
             )
             for index, folder in enumerate(folders):
                 tag = "missing" if not folder.folder_exists else (
@@ -172,31 +272,76 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
                 if tree.exists(item_id):
                     tree.selection_add(item_id)
             result_var.set(
-                f"{len(folders)} trabalho(s) exibido(s) • "
+                f"{len(folders)} de {len(snapshot.folders)} trabalho(s) exibido(s) • "
                 f"{sum(folder.total for folder in folders)} RAW(s)"
             )
 
+        column_to_order = {
+            "id": "ID",
+            "horario": "Horário",
+            "editor": "Editor de foto",
+            "fotografo": "Fotógrafo",
+            "cliente": "Cliente",
+            "servico": "Serviço",
+            "rua": "Rua",
+            "total": "Total RAW",
+            "ultimo_raw": "Último RAW",
+            "situacao": "Situação",
+        }
+        order_to_column = {label: column for column, label in column_to_order.items()}
+
         def sort_by(column: str) -> None:
             if sort_state["column"] == column:
-                sort_state["reverse"] = not sort_state["reverse"]
+                sort_state["reverse"] = not bool(sort_state["reverse"])
             else:
                 sort_state["column"] = column
                 sort_state["reverse"] = False
-            for key, title, _width in definitions:
-                marker = (
-                    " ▲"
-                    if key == column and not sort_state["reverse"]
-                    else " ▼"
-                    if key == column
-                    else ""
-                )
-                tree.heading(key, text=title + marker)
+            order_var.set(column_to_order.get(column, "Horário"))
+            descending_var.set(bool(sort_state["reverse"]))
+            update_headings()
             render()
+
+        def apply_order(*_args) -> None:
+            sort_state["column"] = order_to_column.get(order_var.get(), "horario")
+            sort_state["reverse"] = descending_var.get()
+            update_headings()
+            render()
+
+        def update_headings() -> None:
+            current = str(sort_state["column"])
+            reverse = bool(sort_state["reverse"])
+            for key, title, _width in definitions:
+                marker = " ▼" if key == current and reverse else " ▲" if key == current else ""
+                tree.heading(key, text=title + marker)
+
+        def clear_filters() -> None:
+            photographer_var.set("Todos")
+            editor_var.set("Todos")
+            client_var.set("Todos")
+            service_var.set("Todos")
+            status_var.set("Todos")
+            search_var.set("")
+            order_var.set("Horário")
+            descending_var.set(False)
+            sort_state["column"] = "horario"
+            sort_state["reverse"] = False
+            update_headings()
+            render()
+
+        ttk.Button(
+            controls,
+            text="Limpar filtros",
+            style="Secondary.TButton",
+            command=clear_filters,
+        ).grid(row=3, column=6, sticky="ew")
 
         for key, _title, _width in definitions:
             tree.heading(key, command=lambda column=key: sort_by(column))
-        search_var.trace_add("write", lambda *_args: render())
-        status_var.trace_add("write", lambda *_args: render())
+        for combo in filter_combos[:5]:
+            combo.bind("<<ComboboxSelected>>", render)
+        filter_combos[5].bind("<<ComboboxSelected>>", apply_order)
+        descending_var.trace_add("write", apply_order)
+        search_var.trace_add("write", render)
 
         footer = ttk.Frame(popup, padding=(14, 6, 14, 14))
         footer.grid(row=2, column=0, sticky="ew")
@@ -250,6 +395,8 @@ class RawCreatedDesktopApp(RawCalendarDesktopApp):
             style="Secondary.TButton",
             command=popup.destroy,
         ).grid(row=0, column=3)
+
+        update_headings()
         render()
         search_entry.focus_set()
 
