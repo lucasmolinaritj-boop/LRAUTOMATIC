@@ -22,7 +22,7 @@ dependencies = [
 [project.scripts]
 lrautomatic = "lrautomatic.cli:app"
 lrautomatic-desktop = "lrautomatic.desktop_drag_reliable:main"
-lrautomatic-session-agent = "lrautomatic.session_agent_stable:main"
+lrautomatic-session-agent = "lrautomatic.agent_entrypoint:main"
 lrautomatic-service = "lrautomatic.windows_service:main"
 
 [tool.setuptools.packages.find]
