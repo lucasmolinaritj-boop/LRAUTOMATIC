@@ -90,3 +90,10 @@ try:
     install_homepicz_runtime_responsiveness()
 except Exception:
     pass
+
+try:
+    from .homepicz_rollover_reliability import install_homepicz_rollover_reliability
+
+    install_homepicz_rollover_reliability()
+except Exception:
+    pass
