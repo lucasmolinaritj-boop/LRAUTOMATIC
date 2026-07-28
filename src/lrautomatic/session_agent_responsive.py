@@ -130,12 +130,8 @@ def run_forever_responsive(config_path: str | Path = "config.json") -> None:
                             request_immediate(allow_while_paused=paused)
                             forced_cycle_baseline = baseline
                             forced_job_active = True
-                            if not paused:
-                                _clear_force_flag(settings)
-                            consume_force_next(
-                                settings,
-                                message="Um único ciclo imediato foi solicitado.",
-                            )
+                            # Não consumir aqui: o pedido só termina quando o ciclo
+                            # realmente criar/liberar um job ou concluir sem trabalho.
                             state = (
                                 "forced_cycle_queued_after_current"
                                 if getattr(scheduler, "is_cycle_in_progress", lambda: False)()
@@ -154,9 +150,38 @@ def run_forever_responsive(config_path: str | Path = "config.json") -> None:
                         result = getattr(scheduler, "last_result", None) or {}
                         forced_cycle_baseline = None
                         running_job, queued_job = _job_states(store)
-                        if not running_job and not queued_job:
+                        result_status = str(result.get("status") or "")
+
+                        if running_job or queued_job:
+                            # Agora existe trabalho real: mantém forced_job_active para
+                            # garantir a abertura do catálogo/Lightroom logo abaixo.
+                            if not paused:
+                                _clear_force_flag(settings)
+                            consume_force_next(
+                                settings,
+                                message=(
+                                    "Job criado/liberado com bypass manual do intervalo; "
+                                    "abrindo o Lightroom."
+                                ),
+                            )
+                        elif result_status.startswith("deferred_"):
+                            # Não perde o clique em um adiamento inesperado. O loop
+                            # tentará novamente quando a trava correspondente liberar.
+                            forced_job_active = False
+                            log.warning(
+                                "Ciclo forçado permaneceu pendente: status=%s",
+                                result_status,
+                            )
+                        else:
+                            # Consulta forçada válida, mas sem RAW novo ou com erro de
+                            # origem. Não há job nem Lightroom para abrir.
                             forced_job_active = False
                             _clear_force_flag(settings)
+                            consume_force_next(
+                                settings,
+                                message=f"Ciclo forçado concluído sem job: {result_status or 'sem alteração'}.",
+                            )
+
                         log.info("Ciclo solicitado pelo Monitor concluído: %s", result)
                         _write_startup_state(settings, status="forced_cycle_completed", result=result)
 
