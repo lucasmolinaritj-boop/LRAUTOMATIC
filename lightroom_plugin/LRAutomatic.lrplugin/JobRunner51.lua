@@ -338,23 +338,6 @@ end]],
     'pré-validação e proteção do addPhoto')
 
 source = replaceOnce(source,
-[[        local photo,result,err=importOneAttempt(catalog,path)
-        if result=='imported' or result=='skipped' then return photo,result,nil end
-        lastError=err]],
-[[        local photo,result,err=importOneAttempt(catalog,path)
-        if result=='imported' or result=='skipped' then
-            job.last_import_error=nil
-            job.last_import_error_path=nil
-            return photo,result,nil
-        end
-        lastError=err
-        job.last_import_error=tostring(err or 'falha desconhecida')
-        job.last_import_error_path=path
-        appendJobEvent(job,'import_retry','RAW temporariamente indisponível',path..' — '..job.last_import_error..' — tentativa '..attempt..' de '..MAX_ATTEMPTS..'.','warning')
-        safeWriteJob(jobPath,job)]],
-    'diagnóstico detalhado por tentativa')
-
-source = replaceOnce(source,
 [[    return nil,'failed',lastError or 'falha desconhecida após 10 tentativas'
 end]],
 [[    local finalError=lastError or 'falha desconhecida após 10 tentativas'
