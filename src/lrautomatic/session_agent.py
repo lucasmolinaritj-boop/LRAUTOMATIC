@@ -26,9 +26,15 @@ def _lightroom_processes() -> list[psutil.Process]:
     result: list[psutil.Process] = []
     for process in psutil.process_iter(["pid", "name", "exe"]):
         try:
-            name = (process.info.get("name") or "").lower()
-            exe = (process.info.get("exe") or "").lower()
-            if "lightroom" in name or exe.endswith("lightroom.exe"):
+            name = (process.info.get("name") or "").strip().lower()
+            exe = (process.info.get("exe") or "").strip().lower()
+            # Somente o executável principal conta como Lightroom aberto.
+            # Creative Cloud, crash reporter, helper e downloader não podem
+            # impedir a abertura automática do catálogo.
+            executable_is_lightroom = (
+                exe.endswith("\\lightroom.exe") or exe.endswith("/lightroom.exe")
+            )
+            if name == "lightroom.exe" or executable_is_lightroom:
                 result.append(process)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
