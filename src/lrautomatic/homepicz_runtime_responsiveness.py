@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import homepicz_scheduler as scheduler
-from .homepicz_scheduler_guard import next_poll_seconds
+from .homepicz_scheduler_guard import next_poll_seconds, request_interval_bypass_once
 
 
 class ResponsiveHomePiczScheduler(scheduler.HomePiczScheduler):
@@ -36,6 +36,9 @@ class ResponsiveHomePiczScheduler(scheduler.HomePiczScheduler):
         Quando ``allow_while_paused`` é verdadeiro, exatamente um ciclo pode rodar
         durante a pausa. Isso é usado pelo botão Forçar próximo job.
         """
+        # O botão manual acorda o scheduler e libera somente este próximo ciclo
+        # da espera configurada. A guarda de job ativo continua obrigatória.
+        request_interval_bypass_once()
         if allow_while_paused:
             self.force_cycle_event.set()
         self.wake_event.set()
