@@ -16,6 +16,7 @@ import win32process
 from .automation_control import consume_force_next, read_control
 from .config import load_settings
 from .homepicz_scheduler import HomePiczScheduler, run_cycle
+from .homepicz_scheduler_guard import request_interval_bypass_once
 from .store import JobStore
 
 log = logging.getLogger("lrautomatic.session_agent")
@@ -217,17 +218,41 @@ def run_forever(config_path: str | Path = "config.json") -> None:
                     # Evita dois ciclos Home Picz simultâneos, mas a pausa nunca desliga
                     # permanentemente o scheduler nem impede a criação normal de jobs.
                     scheduler.stop()
+                    # Compatibilidade com instalações que ainda iniciam este agente
+                    # legado: libera exatamente este ciclo da espera de intervalo.
+                    request_interval_bypass_once()
                     result = run_cycle(settings, store)
                     scheduler = HomePiczScheduler(settings, store, config_path=config_path)
                     scheduler.start()
-                    forced_job_active = True
-                    consume_force_next(
-                        settings,
-                        message=f"Ciclo imediato executado: {result.get('status', 'concluído')}.",
-                    )
+                    running_job, queued_job = _job_states(store)
+                    result_status = str(result.get("status") or "")
+
+                    if running_job or queued_job:
+                        forced_job_active = True
+                        consume_force_next(
+                            settings,
+                            message=(
+                                "Job criado/liberado com bypass manual do intervalo; "
+                                "abrindo o Lightroom."
+                            ),
+                        )
+                    elif result_status.startswith("deferred_"):
+                        # Não perde o clique. A trava de job ativo continua válida e o
+                        # pedido será repetido quando puder realmente executar.
+                        forced_job_active = False
+                        log.warning(
+                            "Forçar próximo permaneceu pendente: status=%s",
+                            result_status,
+                        )
+                    else:
+                        forced_job_active = False
+                        consume_force_next(
+                            settings,
+                            message=f"Ciclo forçado concluído sem job: {result_status or 'sem alteração'}.",
+                        )
+
                     log.info("Próximo job forçado pelo Monitor: %s", result)
                     _write_startup_state(settings, status="forced_cycle_completed", result=result)
-                    running_job, queued_job = _job_states(store)
 
                 # Pausado: não abre/troca catálogo para jobs aguardando. Um trabalho já
                 # em execução continua normalmente. O bypass forçado pode iniciar um.
