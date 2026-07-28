@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import threading
 from typing import Any, Callable
 
 from .homepicz_queue_policy import preflight
@@ -10,6 +11,20 @@ HOME_PICZ_PREFIX = "Home Picz - "
 TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled", "interrupted"}
 _ACTIVE_POLL_SECONDS = 15
 _NEXT_POLL_SECONDS = 60
+_FORCE_INTERVAL_BYPASS = threading.Event()
+
+
+def request_interval_bypass_once() -> None:
+    """Libera exatamente um ciclo manual da espera entre execuções."""
+    _FORCE_INTERVAL_BYPASS.set()
+
+
+def _consume_interval_bypass() -> bool:
+    if not _FORCE_INTERVAL_BYPASS.is_set():
+        return False
+    _FORCE_INTERVAL_BYPASS.clear()
+    return True
+
 
 
 def _set_next_poll(seconds: int) -> None:
@@ -79,6 +94,10 @@ def guarded_cycle(
             "reason": "Já existe um job Home Picz queued/running; novo job só será criado após ele terminar.",
         }
 
+    # A força só é consumida depois da guarda de job ativo. Assim ela nunca
+    # cria dois jobs simultâneos e permanece pendente enquanto outro estiver rodando.
+    interval_bypassed = _consume_interval_bypass()
+
     last_job, last_finished = _last_finished_homepicz_job(jobs)
     current = now if isinstance(now, datetime) else datetime.now(timezone.utc)
     if current.tzinfo is None:
@@ -86,7 +105,7 @@ def guarded_cycle(
     else:
         current = current.astimezone(timezone.utc)
 
-    if last_finished is not None:
+    if last_finished is not None and not interval_bypassed:
         next_allowed_at = last_finished + timedelta(minutes=interval_minutes)
         if current < next_allowed_at:
             remaining_seconds = max(1, int((next_allowed_at - current).total_seconds()))
@@ -104,6 +123,8 @@ def guarded_cycle(
             }
 
     result = original_run_cycle(settings, store, now)
+    if interval_bypassed:
+        result["forced_interval_bypass"] = True
     result.setdefault("recovered_stale_job_ids", recovered)
     result.setdefault("execution_interval_minutes", interval_minutes)
 
