@@ -256,6 +256,128 @@ source = replaceOnce(source,
     "local currentPath=photoPath(photo); if success then job.standard_previews_created=job.standard_previews_created+1; if currentPath then previewRetry.standard[currentPath]=nil end else job.standard_previews_failed=job.standard_previews_failed+1; if currentPath then previewRetry.standard[currentPath]=true end; plainLog('STANDARD_PREVIEW_GAVE_UP photo='..index..' error='..tostring(lastError)) end; savePreviewRetry()",
     'controle preview padrão')
 
+
+-- Blindagem de RAWs virtuais/instáveis (Google Drive) e de exceções nativas do
+-- addPhoto. A pré-leitura força a materialização do arquivo antes de entregá-lo
+-- ao Lightroom e a captura fica limitada à chamada síncrona, fora de qualquer
+-- espera/yield do runner.
+source = replaceOnce(source,
+[[local function importOneAttempt(catalog,path)
+    if not path or path=='' then return nil,'failed','caminho vazio' end
+    if not LrFileUtils.exists(path) then return nil,'failed','arquivo não encontrado' end
+    local before=catalog:findPhotoByPath(path)
+    if before then return before,'skipped',nil end
+    local imported=nil
+    local ok,reason=withWrite(catalog,'LRAutomatic: importar foto',function() imported=catalog:addPhoto(path) end,path)
+    if not ok then return nil,'failed',reason end
+    local after=imported or catalog:findPhotoByPath(path)
+    if after then return after,'imported',nil end
+    return nil,'failed','foto não apareceu no catálogo após addPhoto'
+end]],
+[[local function inspectRawFile(path)
+    if not path or path=='' then return false,'caminho vazio',0 end
+    if not LrFileUtils.exists(path) then return false,'arquivo não encontrado',0 end
+
+    local file,openError=io.open(path,'rb')
+    if not file then return false,'arquivo não pôde ser aberto para leitura: '..tostring(openError),0 end
+
+    local sizeBefore,seekError=file:seek('end')
+    if not sizeBefore then file:close(); return false,'não foi possível obter o tamanho: '..tostring(seekError),0 end
+    if sizeBefore<=0 then file:close(); return false,'arquivo com 0 bytes ou ainda não materializado',0 end
+
+    local sampleSize=math.min(65536,sizeBefore)
+    local startOk=file:seek('set',0)
+    local startData=startOk and file:read(sampleSize) or nil
+    local tailOffset=math.max(0,sizeBefore-sampleSize)
+    local tailOk=file:seek('set',tailOffset)
+    local tailData=tailOk and file:read(sampleSize) or nil
+    local sizeAfter=file:seek('end')
+    file:close()
+
+    if not startData or #startData==0 then return false,'início do arquivo ilegível ou indisponível',sizeBefore end
+    if not tailData or #tailData==0 then return false,'fim do arquivo ilegível ou download incompleto',sizeBefore end
+    if not sizeAfter or sizeAfter~=sizeBefore then return false,'tamanho do arquivo mudou durante a leitura',tonumber(sizeAfter) or sizeBefore end
+    return true,nil,sizeBefore
+end
+
+local function importOneAttempt(catalog,path)
+    if not path or path=='' then return nil,'failed','caminho vazio' end
+    local before=catalog:findPhotoByPath(path)
+    if before then return before,'skipped',nil end
+
+    local ready,readError,fileSize=inspectRawFile(path)
+    if not ready then
+        plainLog('IMPORT_PREFLIGHT_FAILED path='..tostring(path)..' size='..tostring(fileSize or 0)..' error='..tostring(readError))
+        return nil,'failed','pré-validação recusou o RAW: '..tostring(readError)
+    end
+    plainLog('IMPORT_PREFLIGHT_OK path='..tostring(path)..' size='..tostring(fileSize))
+
+    local imported=nil
+    local addPhotoOk=true
+    local addPhotoError=nil
+    local ok,reason=withWrite(catalog,'LRAutomatic: importar foto',function()
+        local protectedOk,protectedResult=pcall(function() return catalog:addPhoto(path) end)
+        if protectedOk then
+            imported=protectedResult
+        else
+            addPhotoOk=false
+            addPhotoError=tostring(protectedResult)
+        end
+    end,path)
+
+    if not ok then return nil,'failed','acesso de escrita recusado: '..tostring(reason) end
+    if not addPhotoOk then
+        plainLog('IMPORT_ADD_PHOTO_EXCEPTION path='..tostring(path)..' error='..tostring(addPhotoError))
+        return nil,'failed','Lightroom recusou addPhoto: '..tostring(addPhotoError)
+    end
+
+    local after=imported or catalog:findPhotoByPath(path)
+    if after then return after,'imported',nil end
+    return nil,'failed','foto não apareceu no catálogo após addPhoto'
+end]],
+    'pré-validação e proteção do addPhoto')
+
+source = replaceOnce(source,
+[[        local photo,result,err=importOneAttempt(catalog,path)
+        if result=='imported' or result=='skipped' then return photo,result,nil end
+        lastError=err]],
+[[        local photo,result,err=importOneAttempt(catalog,path)
+        if result=='imported' or result=='skipped' then
+            job.last_import_error=nil
+            job.last_import_error_path=nil
+            return photo,result,nil
+        end
+        lastError=err
+        job.last_import_error=tostring(err or 'falha desconhecida')
+        job.last_import_error_path=path
+        appendJobEvent(job,'import_retry','RAW temporariamente indisponível',path..' — '..job.last_import_error..' — tentativa '..attempt..' de '..MAX_ATTEMPTS..'.','warning')
+        safeWriteJob(jobPath,job)]],
+    'diagnóstico detalhado por tentativa')
+
+source = replaceOnce(source,
+[[    return nil,'failed',lastError or 'falha desconhecida após 10 tentativas'
+end]],
+[[    local finalError=lastError or 'falha desconhecida após 10 tentativas'
+    job.bad_files=type(job.bad_files)=='table' and job.bad_files or {}
+    local alreadyRecorded=false
+    for _,bad in ipairs(job.bad_files) do
+        if type(bad)=='table' and tostring(bad.path)==tostring(path) then
+            bad.error=tostring(finalError)
+            bad.attempts=MAX_ATTEMPTS
+            alreadyRecorded=true
+            break
+        end
+    end
+    if not alreadyRecorded then table.insert(job.bad_files,{path=path,error=tostring(finalError),attempts=MAX_ATTEMPTS,at=timestamp()}) end
+    job.bad_files_count=#job.bad_files
+    job.completed_with_file_errors=true
+    appendJobEvent(job,'import_file_failed','RAW isolado após todas as tentativas',path..' — '..tostring(finalError)..'. A fila continuará com os demais arquivos.','error')
+    safeWriteJob(jobPath,job)
+    plainLog('IMPORT_FILE_ISOLATED path='..tostring(path)..' error='..tostring(finalError))
+    return nil,'failed',finalError
+end]],
+    'isolamento definitivo do RAW sem interromper a fila')
+
 _G.import = function(moduleName)
     if moduleName == 'LrTasks' then return compatibleTasks end
     return originalImport(moduleName)
