@@ -6,7 +6,9 @@ local originalOpen = io.open
 local targetPath = LrPathUtils.child(_PLUGIN.path, 'JobRunner51.lua')
 
 local injection = [=[
--- AUDITORIA ADDPHOTO: nenhuma exceção de write gate pode escapar para popup.
+-- WRITE GATE COMPATÍVEL COM LR 10.4: operações do catálogo podem fazer yield.
+-- Por isso, withWriteAccessDo e sua callback nunca podem ficar dentro de
+-- pcall/xpcall no Lua 5.1 do Lightroom.
 source = replaceOnce(source,
 [[local function withWrite(catalog,actionName,fn,detail)
     local ran,timedOut=false,false
@@ -17,7 +19,6 @@ source = replaceOnce(source,
 end]],
 [[local function withWrite(catalog,actionName,fn,detail)
     local ran,timedOut=false,false
-    local callbackOk,callbackError=true,nil
     plainLog('WRITE_BEGIN action='..actionName..' detail='..tostring(detail))
     if not catalog then return false,'catálogo indisponível' end
     local gate=catalog.withWriteAccessDo
@@ -25,25 +26,14 @@ end]],
         plainLog('WRITE_REJECTED action='..actionName..' reason=withWriteAccessDo_nil catalog_type='..type(catalog))
         return false,'API withWriteAccessDo indisponível'
     end
-    local gateOk,statusOrError=pcall(function()
-        return gate(catalog,actionName,function(context)
-            ran=true
-            callbackOk,callbackError=pcall(fn,context)
-        end,{timeout=15,callback=function() timedOut=true end})
-    end)
-    if not gateOk then
-        plainLog('WRITE_EXCEPTION action='..actionName..' detail='..tostring(detail)..' error='..tostring(statusOrError))
-        return false,tostring(statusOrError)
-    end
-    if not callbackOk then
-        plainLog('WRITE_CALLBACK_EXCEPTION action='..actionName..' detail='..tostring(detail)..' error='..tostring(callbackError))
-        return false,tostring(callbackError)
-    end
-    local status=statusOrError
+    local status=gate(catalog,actionName,function(context)
+        ran=true
+        fn(context)
+    end,{timeout=15,callback=function() timedOut=true end})
     plainLog('WRITE_END action='..actionName..' status='..tostring(status)..' ran='..tostring(ran)..' timeout='..tostring(timedOut))
     return ran and not timedOut and (status==nil or status=='executed'),tostring(status or 'executed')
 end]],
-'write gate protegido contra popup')
+'write gate compatível com yield')
 
 -- Reobtém o catálogo ativo antes de cada importação, valida identidade e captura
 -- a função addPhoto antes da callback. Se a API estiver indisponível, registra e
