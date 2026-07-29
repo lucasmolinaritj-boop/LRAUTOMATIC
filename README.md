@@ -169,6 +169,20 @@ O executor grava um log simples em:
 
 Ele registra carregamento, pasta da fila, catálogo ativo, fotos encontradas, importações com falha e conclusão do job.
 
+### Motor canônico 5.0
+
+O plugin usa somente `JobRunner.lua` e `JobRunnerCore.lua`. As antigas camadas
+numéricas de transformação em memória foram removidas.
+
+- A contagem é concluída e persistida antes da primeira importação.
+- Listas extensas de RAWs ficam em manifestos dentro de
+  `%LOCALAPPDATA%\LRAutomatic\inventories`, fora do JSON principal do job.
+- Retomadas reutilizam o manifesto e a posição da última foto confirmada.
+- Erros permanentes não são repetidos; falhas transitórias usam esperas curtas;
+  arquivos ainda sendo materializados pelo Google Drive usam espera progressiva.
+- Operações do catálogo que podem fazer `yield` não são envolvidas por
+  `pcall`/`xpcall`, mantendo compatibilidade com o Lightroom Classic 10.4.
+
 ## ZIP de diagnóstico
 
 Pelo aplicativo, clique em **Gerar ZIP de diagnóstico**.

@@ -1,12 +1,10 @@
 -- Motor oficial e estável do LRAutomatic para Lightroom Classic 10.4.
---
--- Este é o único ponto de entrada permitido para o executor. Não criar novos
--- JobRunnerNN.lua. As camadas numeradas restantes são implementação-base legada
--- temporária e não devem ser referenciadas por Init.lua ou outros módulos.
+-- O núcleo é carregado diretamente; as antigas camadas numeradas não
+-- participam mais do caminho de execução.
 local LrFileUtils = import 'LrFileUtils'
 local LrPathUtils = import 'LrPathUtils'
 
-local Runner = require 'JobRunner57'
+local Runner = require 'JobRunnerCore'
 local CollectionOrganizer = require 'CollectionOrganizerReliable'
 local originalProcessQueuedOnce = Runner.processQueuedOnce
 local originalRunLoop = Runner.runLoop
@@ -65,13 +63,12 @@ function Runner.processQueuedOnce()
 end
 
 function Runner.runLoop(shouldStop)
-    -- O JobRunner57 já fornece o loop direto e contínuo, sem worker filho.
-    -- Repassar a condição real de encerramento evita tanto o loop que não inicia
-    -- quanto wrappers pcall/xpcall incompatíveis com operações que fazem yield.
+    -- O núcleo executa diretamente, sem worker filho nem pcall/xpcall sobre APIs
+    -- do catálogo que podem fazer yield.
     return originalRunLoop(shouldStop)
 end
 
 Runner.engine_name = 'JobRunner'
-Runner.engine_version = '4.11.4-yield-safe-counted-lr104'
+Runner.engine_version = '5.0.0-canonical-yield-safe'
 
 return Runner

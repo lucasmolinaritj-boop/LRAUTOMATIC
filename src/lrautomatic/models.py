@@ -48,6 +48,7 @@ class SourceStatus(StrEnum):
     QUEUED = 'queued'
     RUNNING = 'running'
     COMPLETED = 'completed'
+    PARTIAL = 'partial'
     FAILED = 'failed'
     CANCELLED = 'cancelled'
 
@@ -113,6 +114,9 @@ class SourceProgress(BaseModel):
     discovered_files: list[str] = Field(default_factory=list)
     scan_completed: bool = False
     scan_completed_at: str | None = None
+    inventory_manifest: str | None = None
+    inventory_reused: bool = False
+    next_index: int = Field(default=1, ge=1)
 
 
 class JobEvent(BaseModel):
@@ -129,14 +133,15 @@ class BadFileRecord(BaseModel):
     model_config = ConfigDict(extra='allow')
 
     path: str
-    reason: str
+    reason: str = ''
+    error: str | None = None
     at: str = Field(default_factory=utc_now)
 
 
 class ImportJob(BaseModel):
     model_config = ConfigDict(extra='allow')
 
-    schema_version: int = 11
+    schema_version: int = 12
     job_id: str = Field(default_factory=lambda: f'job_{uuid4().hex}')
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
