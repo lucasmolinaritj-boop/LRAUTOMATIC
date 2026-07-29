@@ -40,8 +40,30 @@ source = replaceOnce(source,
     'retorno de cache do inventário')
 
 source = replaceOnce(source,
-    "local files,scanError=collectFiles(source.path,source.recursive==true,allowed); progress.discovered=#files; progress.status=scanError and 'failed' or 'running'; progress.error=scanError",
-    "local files,scanError,reusedInventory=collectFiles(source.path,source.recursive==true,allowed,progress.discovered_files); progress.discovered=#files; progress.status=scanError and 'failed' or 'running'; progress.error=scanError; if not scanError and not reusedInventory then progress.discovered_files=files; progress.scan_completed=true; progress.scan_completed_at=timestamp() end; job.inventory_reused_count=(job.inventory_reused_count or 0)+(reusedInventory and 1 or 0)",
+[[    local files,collectError=collectFiles(source.path,recursive,allowed)
+    if collectError then progress.discovered=0; progress.status='failed'; progress.error=collectError; safeWriteJob(jobPath,job); return true end
+    progress.discovered=#files; safeWriteJob(jobPath,job)]],
+[[    job.current_stage='counting'
+    local files,collectError,reusedInventory=collectFiles(source.path,recursive,allowed,progress.discovered_files)
+    if collectError then
+        progress.discovered=0
+        progress.scan_completed=false
+        progress.status='failed'
+        progress.error=collectError
+        safeWriteJob(jobPath,job)
+        return true
+    end
+    progress.discovered=#files
+    progress.status='running'
+    progress.error=nil
+    progress.scan_completed=true
+    progress.scan_completed_at=progress.scan_completed_at or timestamp()
+    if not reusedInventory then progress.discovered_files=files end
+    job.inventory_reused_count=(job.inventory_reused_count or 0)+(reusedInventory and 1 or 0)
+    refreshTotals(job)
+    job.current_stage='counted'
+    safeWriteJob(jobPath,job)
+    job.current_stage='importing']],
     'uso do inventário persistente')
 
 -- ARQUIVOS DANIFICADOS: isola a falha no nível da foto. Arquivo inexistente,
@@ -129,13 +151,6 @@ end]],
     return foundActive
 end]],
     'recuperação imediata de job running órfão')
-
--- Qualquer exceção inesperada em um ciclo é registrada e o estado ativo é limpo,
--- permitindo que o loop continue e processe o próximo job em vez de morrer.
-source = replaceOnce(source,
-    "        Runner.processQueuedOnce()\n        LrTasks.sleep(1)",
-    "        local cycleOk,cycleError=xpcall(function() Runner.processQueuedOnce() end,function(err) return debug and debug.traceback and debug.traceback(tostring(err),2) or tostring(err) end)\n        if not cycleOk then\n            plainLog('QUEUE_CYCLE_EXCEPTION '..tostring(cycleError))\n            if activeJobPath and activeJob then\n                local disk=readJson(activeJobPath)\n                if disk and tostring(disk.status)=='running' then\n                    disk.status='queued'; disk.current_stage='recovered_exception'; disk.recovery_count=(disk.recovery_count or 0)+1; disk.runner_instance_id=nil\n                    appendJobEvent(disk,'recovered','Runner recuperado após exceção',tostring(cycleError),'error')\n                    writeJsonAtomic(activeJobPath,disk)\n                end\n            end\n            clearActive(); leaderSince=nil\n        end\n        LrTasks.sleep(1)",
-    'proteção do ciclo principal da fila')
 
 -- Persistência em lote para todos os resultados. A interface não precisa de uma
 -- gravação por foto: salva a cada 10 itens ou 2 segundos e sempre ao fechar a pasta.
