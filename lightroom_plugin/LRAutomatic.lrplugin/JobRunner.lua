@@ -72,6 +72,6 @@ function Runner.runLoop(shouldStop)
 end
 
 Runner.engine_name = 'JobRunner'
-Runner.engine_version = '4.11.3-collections-reliable-lr104'
+Runner.engine_version = '4.11.4-yield-safe-counted-lr104'
 
 return Runner
