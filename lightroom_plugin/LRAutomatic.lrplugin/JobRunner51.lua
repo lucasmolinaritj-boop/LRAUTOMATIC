@@ -259,8 +259,8 @@ source = replaceOnce(source,
 
 -- Blindagem de RAWs virtuais/instáveis (Google Drive) e de exceções nativas do
 -- addPhoto. A pré-leitura força a materialização do arquivo antes de entregá-lo
--- ao Lightroom e a captura fica limitada à chamada síncrona, fora de qualquer
--- espera/yield do runner.
+-- ao Lightroom. A chamada addPhoto precisa permanecer direta: no Lua 5.1 do
+-- Lightroom ela pode fazer yield e, portanto, não pode ficar dentro de pcall.
 source = replaceOnce(source,
 [[local function importOneAttempt(catalog,path)
     if not path or path=='' then return nil,'failed','caminho vazio' end
@@ -313,23 +313,11 @@ local function importOneAttempt(catalog,path)
     plainLog('IMPORT_PREFLIGHT_OK path='..tostring(path)..' size='..tostring(fileSize))
 
     local imported=nil
-    local addPhotoOk=true
-    local addPhotoError=nil
     local ok,reason=withWrite(catalog,'LRAutomatic: importar foto',function()
-        local protectedOk,protectedResult=pcall(function() return catalog:addPhoto(path) end)
-        if protectedOk then
-            imported=protectedResult
-        else
-            addPhotoOk=false
-            addPhotoError=tostring(protectedResult)
-        end
+        imported=catalog:addPhoto(path)
     end,path)
 
     if not ok then return nil,'failed','acesso de escrita recusado: '..tostring(reason) end
-    if not addPhotoOk then
-        plainLog('IMPORT_ADD_PHOTO_EXCEPTION path='..tostring(path)..' error='..tostring(addPhotoError))
-        return nil,'failed','Lightroom recusou addPhoto: '..tostring(addPhotoError)
-    end
 
     local after=imported or catalog:findPhotoByPath(path)
     if after then return after,'imported',nil end
