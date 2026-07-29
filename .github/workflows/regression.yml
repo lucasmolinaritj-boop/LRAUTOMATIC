@@ -1,0 +1,43 @@
+name: Regressão
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  runner:
+    name: Motor e modelos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar projeto
+        run: python -m pip install -e .
+
+      - name: Executar regressões
+        run: python -m unittest discover -s tests -v
+
+      - name: Preparar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validar sintaxe Lua
+        run: |
+          npm install --no-save fengari-node-cli@0.1.0
+          for file in lightroom_plugin/LRAutomatic.lrplugin/*.lua; do
+            ./node_modules/.bin/fengaric -p "$file"
+          done
